@@ -674,57 +674,159 @@ function New-WIMServicingADR {
         }
     }
 
-    # --- Build UpdateRuleXML for WMI/CIM/AdminService creation ---
-    # The SMS Provider REQUIRES UpdateRuleXML (search criteria) to create an ADR.
-    # Without it, creation is rejected with WBEM_E_FAILED (0x80041001).
-    $updateRuleXML = @"
-<AutoDeploymentRule>
-  <UpdateRuleProperties>
-    <Property PropertyName="_Product" Operator="In">
-      <Values><Value>$($OS.Product)</Value></Values>
-    </Property>
-    <Property PropertyName="_UpdateClassification" Operator="In">
-      <Values>
-        <Value>Security Updates</Value>
-        <Value>Critical Updates</Value>
-        <Value>Updates</Value>
-      </Values>
-    </Property>
-    <Property PropertyName="LocalizedDisplayName" Operator="Contains">
-      <Values><Value>$titleCriteria</Value></Values>
-    </Property>
-    <Property PropertyName="IsSuperseded" Operator="Equals">
-      <Values><Value>false</Value></Values>
-    </Property>
-    <Property PropertyName="IsExpired" Operator="Equals">
-      <Values><Value>false</Value></Values>
-    </Property>
-  </UpdateRuleProperties>
-</AutoDeploymentRule>
+    # --- Build XML templates for WMI/CIM/AdminService creation ---
+    # The SMS Provider requires ALL FOUR XML properties to create an ADR:
+    #   1. ContentTemplate (root: ContentActionXML)
+    #   2. DeploymentTemplate (root: TemplateDescription)
+    #   3. UpdateRuleXML (root: UpdateXML with UpdateXMLDescriptionItems)
+    #   4. AutoDeploymentProperties (search criteria XML)
+    # Getting ANY of these wrong or missing causes "Generic failure" on Put().
+    #
+    # Best approach: copy XML from an existing ADR on the server and modify it.
+    # Fallback: use correctly-structured XML templates.
+
+    $templateSource = $null
+    if ($script:ADRWmiClass) {
+        Write-Log "Looking for existing ADR to use as XML template source..."
+        try {
+            $existingADRs = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                          -Class $script:ADRWmiClass `
+                                          -ErrorAction SilentlyContinue
+            if ($existingADRs) {
+                # Pick the first ADR that has all XML properties populated
+                $candidates = @($existingADRs)
+                foreach ($candidate in $candidates) {
+                    if ($candidate.ContentTemplate -and $candidate.DeploymentTemplate -and $candidate.UpdateRuleXML) {
+                        $templateSource = $candidate
+                        Write-Log "Found template source ADR: '$($candidate.Name)'" -Level SUCCESS
+                        break
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Template source search failed (non-fatal): $_" -Level WARN
+        }
+    }
+
+    if ($templateSource) {
+        # Clone XML from existing ADR and modify the relevant values
+        Write-Log "Cloning XML templates from existing ADR..."
+
+        # ContentTemplate - replace PackageId
+        [xml]$ctXml = $templateSource.ContentTemplate
+        $pkgNode = $ctXml.SelectSingleNode('//PackageId')
+        if (-not $pkgNode) { $pkgNode = $ctXml.SelectSingleNode('//PackageID') }
+        if ($pkgNode -and $resolvedPkgID) { $pkgNode.InnerText = $resolvedPkgID }
+        $contentTemplateXML = $ctXml.OuterXml
+
+        # DeploymentTemplate - replace CollectionId
+        [xml]$dtXml = $templateSource.DeploymentTemplate
+        $collNode = $dtXml.SelectSingleNode('//CollectionId')
+        if (-not $collNode) { $collNode = $dtXml.SelectSingleNode('//CollectionID') }
+        if ($collNode) { $collNode.InnerText = $resolvedCollID }
+        $deployTemplateXML = $dtXml.OuterXml
+
+        # UpdateRuleXML - use as-is for initial creation; we'll overwrite criteria via
+        # Set-WIMServicingADRProperties after creation
+        $updateRuleXML = $templateSource.UpdateRuleXML
+
+        # AutoDeploymentProperties - use as-is; will be overwritten after creation
+        $autoDeployProps = $templateSource.AutoDeploymentProperties
+
+    } else {
+        Write-Log "No existing ADR found for template. Building XML from scratch..." -Level WARN
+
+        # ContentTemplate - must use <ContentActionXML> root element
+        $contentTemplateXML = @"
+<ContentActionXML>
+  <PackageId>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageId>
+  <DownloadFromInternet>true</DownloadFromInternet>
+  <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
+  <ContentLocales><Locale>Locale:9</Locale><Locale>Locale:0</Locale></ContentLocales>
+</ContentActionXML>
 "@
-    $contentTemplateXML = @"
-<ContentTemplate SchemaVersion="1.0">
-  <ContentAction>
-    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
-    <DownloadFromInternet>true</DownloadFromInternet>
-    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
-  </ContentAction>
-</ContentTemplate>
-"@
-    $deployTemplateXML = @"
-<DeploymentCreationActionXML SchemaVersion="1.0">
-  <CollectionID>$resolvedCollID</CollectionID>
-  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
-  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
-  <UserNotificationOption>DisplayAll</UserNotificationOption>
-  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
-  <AllowRestart>false</AllowRestart>
+
+        # DeploymentTemplate - must use <TemplateDescription> root element
+        $deployTemplateXML = @"
+<TemplateDescription xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
+  <CollectionId>$resolvedCollID</CollectionId>
+  <IncludeSub>true</IncludeSub>
+  <AttendedInstall>false</AttendedInstall>
+  <UTC>true</UTC>
+  <Duration>0</Duration>
+  <DurationUnits>hours</DurationUnits>
   <SuppressServers>Unchecked</SuppressServers>
   <SuppressWorkstations>Unchecked</SuppressWorkstations>
-  <EnableWakeOnLan>false</EnableWakeOnLan>
+  <AllowRestart>false</AllowRestart>
+  <Deploy>true</Deploy>
+  <LocalDPOption>InstallFromDistributionPoint</LocalDPOption>
+  <RemoteDPOption>InstallFromDistributionPoint</RemoteDPOption>
+  <DisableMomAlert>false</DisableMomAlert>
+  <GenerateMomAlert>false</GenerateMomAlert>
+  <UseRemoteDP>false</UseRemoteDP>
+  <UseUnprotectedDP>false</UseUnprotectedDP>
+  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
+  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
+  <UserNotification>DisplayAll</UserNotification>
+  <AllowSoftwareInstallationOutOfWindow>false</AllowSoftwareInstallationOutOfWindow>
+  <AllowRestart>false</AllowRestart>
+  <SoftDeadlineEnabled>true</SoftDeadlineEnabled>
+  <RequirePostRebootFullScan>false</RequirePostRebootFullScan>
   <EnableAlert>false</EnableAlert>
-</DeploymentCreationActionXML>
+</TemplateDescription>
 "@
+
+        # UpdateRuleXML - must use <UpdateXML> with <UpdateXMLDescriptionItems>
+        # The PropertyName values use underscore prefix for SCCM category properties
+        $updateRuleXML = @"
+<UpdateXML>
+  <UpdateXMLDescriptionItems>
+    <UpdateXMLDescriptionItem PropertyName="_Product" UIPropertyName="Products">
+      <MatchRules>
+        <string>$($OS.Product)</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="_UpdateClassification" UIPropertyName="UpdateClassification">
+      <MatchRules>
+        <string>Security Updates</string>
+        <string>Critical Updates</string>
+        <string>Updates</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="LocalizedDisplayName" UIPropertyName="Title">
+      <MatchRules>
+        <string>%$titleCriteria%</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="IsSuperseded" UIPropertyName="Superseded">
+      <MatchRules>
+        <string>false</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="IsExpired" UIPropertyName="Expired">
+      <MatchRules>
+        <string>false</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+  </UpdateXMLDescriptionItems>
+</UpdateXML>
+"@
+
+        # AutoDeploymentProperties - the search/evaluation criteria blob
+        $autoDeployProps = @"
+<AutoDeploymentRule>
+  <SearchCriteria>
+    <Products><Value>$($OS.Product)</Value></Products>
+    <UpdateClassifications>
+      <Value>Security Updates</Value>
+      <Value>Critical Updates</Value>
+      <Value>Updates</Value>
+    </UpdateClassifications>
+  </SearchCriteria>
+  <EvaluationSchedule>None</EvaluationSchedule>
+</AutoDeploymentRule>
+"@
+    }
 
     # --- Attempt 4: AdminService REST API ---
     # ConfigMgr CB exposes a REST API (AdminService) on the SMS Provider.
@@ -748,12 +850,14 @@ function New-WIMServicingADR {
                 } catch { }
 
                 $body = @{
-                    Name               = $Name
-                    Description        = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                    CollectionID       = $resolvedCollID
-                    UpdateRuleXML      = $updateRuleXML
-                    ContentTemplate    = $contentTemplateXML
-                    DeploymentTemplate = $deployTemplateXML
+                    Name                      = $Name
+                    Description               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                    CollectionID              = $resolvedCollID
+                    UpdateRuleXML             = $updateRuleXML
+                    ContentTemplate           = $contentTemplateXML
+                    DeploymentTemplate        = $deployTemplateXML
+                    AutoDeploymentProperties  = $autoDeployProps
+                    AutoDeploymentEnabled     = $true
                 } | ConvertTo-Json -Depth 5
 
                 $response = Invoke-RestMethod -Uri $adminSvcUrl `
@@ -781,13 +885,14 @@ function New-WIMServicingADR {
         try {
             $cimSession = New-CimSession -ComputerName $SiteServer -ErrorAction Stop
             $adrProperties = @{
-                Name                  = $Name
-                Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                CollectionID          = $resolvedCollID
-                AutoDeploymentEnabled = $true
-                UpdateRuleXML         = $updateRuleXML
-                ContentTemplate       = $contentTemplateXML
-                DeploymentTemplate    = $deployTemplateXML
+                Name                      = $Name
+                Description               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                CollectionID              = $resolvedCollID
+                AutoDeploymentEnabled     = $true
+                UpdateRuleXML             = $updateRuleXML
+                ContentTemplate           = $contentTemplateXML
+                DeploymentTemplate        = $deployTemplateXML
+                AutoDeploymentProperties  = $autoDeployProps
             }
             $newADR = New-CimInstance -Namespace $wmiNS `
                                       -ClassName $script:ADRWmiClass `
@@ -812,12 +917,14 @@ function New-WIMServicingADR {
             $mPath   = [System.Management.ManagementPath]::new($script:ADRWmiClass)
             $mc      = [System.Management.ManagementClass]::new($scope, $mPath, $null)
             $newADR  = $mc.CreateInstance()
-            $newADR["Name"]               = $Name
-            $newADR["Description"]        = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-            $newADR["CollectionID"]       = $resolvedCollID
-            $newADR["UpdateRuleXML"]      = $updateRuleXML
-            $newADR["ContentTemplate"]    = $contentTemplateXML
-            $newADR["DeploymentTemplate"] = $deployTemplateXML
+            $newADR["Name"]                      = $Name
+            $newADR["Description"]               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+            $newADR["CollectionID"]              = $resolvedCollID
+            $newADR["AutoDeploymentEnabled"]     = $true
+            $newADR["UpdateRuleXML"]             = $updateRuleXML
+            $newADR["ContentTemplate"]           = $contentTemplateXML
+            $newADR["DeploymentTemplate"]        = $deployTemplateXML
+            $newADR["AutoDeploymentProperties"]  = $autoDeployProps
             $newADR.Put() | Out-Null
 
             Start-Sleep -Seconds 3
