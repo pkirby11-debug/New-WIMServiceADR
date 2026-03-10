@@ -190,6 +190,62 @@ $PackageSourcePath = Join-Path $PackageSourceRoot $OSVersion
 
 #region --- Functions ---
 
+# Script-level variable for the correct WMI class name for ADRs.
+# Discovered at runtime since it varies by ConfigMgr version.
+$script:ADRWmiClass = $null
+
+function Resolve-ADRWmiClassName {
+    # Discovers the correct WMI class name for Automatic Deployment Rules.
+    # The CM cmdlet is "New-CMAutoDeploymentRule" but the WMI class varies:
+    #   - SMS_AutoDeployment (most ConfigMgr CB versions)
+    #   - SMS_AutoDeploymentRule (some documentation references this but it
+    #     doesn't actually exist as a WMI class in most environments)
+    $wmiNS = "root\SMS\site_$SiteCode"
+
+    # Candidate class names in order of likelihood
+    $candidates = @('SMS_AutoDeployment', 'SMS_AutoDeploymentRule')
+
+    foreach ($className in $candidates) {
+        try {
+            # Test if the class exists by querying for it
+            $testQuery = Get-WmiObject -Namespace $wmiNS `
+                                       -ComputerName $SiteServer `
+                                       -Class $className `
+                                       -List `
+                                       -ErrorAction Stop |
+                         Where-Object { $_.Name -eq $className }
+            if ($testQuery) {
+                Write-Log "Discovered ADR WMI class: $className"
+                $script:ADRWmiClass = $className
+                return $className
+            }
+        } catch {
+            # Class doesn't exist in this namespace, try next
+        }
+    }
+
+    # Broader discovery - search for any class containing "AutoDeploy"
+    Write-Log "Standard class names not found. Searching for AutoDeploy* classes..." -Level WARN
+    try {
+        $allClasses = Get-WmiObject -Namespace $wmiNS `
+                                    -ComputerName $SiteServer `
+                                    -List `
+                                    -ErrorAction Stop |
+                      Where-Object { $_.Name -like '*AutoDeploy*' }
+        if ($allClasses) {
+            $found = ($allClasses | Select-Object -First 1).Name
+            Write-Log "Found ADR-related WMI class: $found" -Level WARN
+            $script:ADRWmiClass = $found
+            return $found
+        }
+    } catch {
+        Write-Log "WMI class discovery failed: $_" -Level WARN
+    }
+
+    Write-Log "Could not discover ADR WMI class. WMI-based ADR operations will be skipped." -Level ERROR
+    return $null
+}
+
 function Connect-SCCMSite {
     param([string]$Code, [string]$Server)
 
@@ -427,7 +483,7 @@ function New-WIMServicingADR {
         try {
             $wmiAdr = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                     -ComputerName $SiteServer `
-                                    -Class SMS_AutoDeploymentRule `
+                                    -Class $script:ADRWmiClass `
                                     -Filter "Name = '$Name'" `
                                     -ErrorAction SilentlyContinue
             if ($wmiAdr) { $existing = $wmiAdr }
@@ -542,7 +598,7 @@ function New-WIMServicingADR {
 
     # Strategy: The CM cmdlet has a null-key bug that triggers on every call in
     # some console versions. Even Name + CollectionId alone fails.
-    # SMS_AutoDeploymentRule also does not support direct WMI CreateInstance().
+    # The ADR WMI class does not support direct WMI CreateInstance().
     #
     # Approach: Try multiple cmdlet variations (different parameter combos trigger
     # different internal code paths), then CIM, then [wmiclass] COM interop.
@@ -592,7 +648,7 @@ function New-WIMServicingADR {
     # --- Attempt 4: CIM-based creation ---
     # CIM (WMI v2) uses a different provider pipeline than System.Management.
     # Some classes that don't support old-style CreateInstance() work via CIM.
-    if (-not $adr) {
+    if (-not $adr -and $script:ADRWmiClass) {
         Write-Log "Trying CIM-based ADR creation (New-CimInstance)..."
         $wmiNS = "root\SMS\site_$SiteCode"
         try {
@@ -630,7 +686,7 @@ function New-WIMServicingADR {
             }
 
             $newADR = New-CimInstance -Namespace $wmiNS `
-                                      -ClassName SMS_AutoDeploymentRule `
+                                      -ClassName $script:ADRWmiClass `
                                       -Property $adrProperties `
                                       -CimSession $cimSession `
                                       -ErrorAction Stop
@@ -648,11 +704,11 @@ function New-WIMServicingADR {
     # --- Attempt 5: [wmiclass] COM interop with SpawnInstance_ ---
     # Uses the native WMI COM API instead of .NET ManagementClass.
     # SpawnInstance_ is a different entry point than CreateInstance().
-    if (-not $adr) {
+    if (-not $adr -and $script:ADRWmiClass) {
         Write-Log "Trying [wmiclass] COM interop (SpawnInstance_)..."
         $wmiNS = "root\SMS\site_$SiteCode"
         try {
-            $wmiClass = [wmiclass]"\\$SiteServer\${wmiNS}:SMS_AutoDeploymentRule"
+            $wmiClass = [wmiclass]"\\$SiteServer\${wmiNS}:$($script:ADRWmiClass)"
             $newADR   = $wmiClass.SpawnInstance_()
             $newADR.Name                  = $Name
             $newADR.Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
@@ -686,7 +742,7 @@ function New-WIMServicingADR {
             Start-Sleep -Seconds 3
 
             $adrWmiCheck = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
-                                         -Class SMS_AutoDeploymentRule `
+                                         -Class $script:ADRWmiClass `
                                          -Filter "Name = '$Name'" -ErrorAction Stop
             if (-not $adrWmiCheck) { throw "ADR not found after WMI creation." }
 
@@ -733,7 +789,7 @@ function Set-ADRCollectionViaWMI {
     try {
         $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                 -ComputerName $SiteServer `
-                                -Class SMS_AutoDeploymentRule `
+                                -Class $script:ADRWmiClass `
                                 -Filter "Name = '$ADRName'" `
                                 -ErrorAction Stop
         if ($adrWmi -and $adrWmi.CollectionID -ne $CollectionID) {
@@ -764,7 +820,7 @@ function Set-ADRPackageViaWMI {
     try {
         $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                 -ComputerName $SiteServer `
-                                -Class SMS_AutoDeploymentRule `
+                                -Class $script:ADRWmiClass `
                                 -Filter "Name = '$ADRName'" `
                                 -ErrorAction Stop
         if ($adrWmi) {
@@ -796,7 +852,7 @@ function Set-WIMServicingADRProperties {
 
     $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                             -ComputerName $SiteServer `
-                            -Class SMS_AutoDeploymentRule `
+                            -Class $script:ADRWmiClass `
                             -Filter "Name = '$ADRName'"
 
     if (-not $adrWmi) {
@@ -870,7 +926,7 @@ function Set-WIMServicingADRProperties {
             # Re-fetch to avoid stale object
             $adrWmi2 = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                      -ComputerName $SiteServer `
-                                     -Class SMS_AutoDeploymentRule `
+                                     -Class $script:ADRWmiClass `
                                      -Filter "Name = '$ADRName'"
             if ($adrWmi2) {
                 $adrWmi2.Schedule = $ScheduleToken
@@ -943,6 +999,13 @@ Write-Log "Include .NET   : $($IncludeDotNet.IsPresent)"
 
 try {
     Connect-SCCMSite -Code $SiteCode -Server $SiteServer
+
+    # Discover the correct WMI class name for ADRs (varies by ConfigMgr version)
+    $adrClass = Resolve-ADRWmiClassName
+    if (-not $adrClass) {
+        Write-Log "WARNING: ADR WMI class not found. WMI-based ADR operations may fail." -Level WARN
+        Write-Log "The script will still attempt cmdlet-based creation." -Level WARN
+    }
 
     # Warn if product not in SUP sync
     Test-SUPProductSync -ProductName $osInfo.Product
