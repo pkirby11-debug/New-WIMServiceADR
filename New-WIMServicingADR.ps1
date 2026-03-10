@@ -540,54 +540,71 @@ function New-WIMServicingADR {
 
     Write-Log "  Title criteria: $titleCriteria"
 
-    # Strategy: The CM cmdlet has a null-key bug that triggers when filter criteria
-    # parameters (Product, UpdateClassification, Architecture, Language) are passed.
-    # Even CollectionId can trigger it in some versions.
+    # Strategy: The CM cmdlet has a null-key bug that triggers on every call in
+    # some console versions. Even Name + CollectionId alone fails.
+    # SMS_AutoDeploymentRule also does not support direct WMI CreateInstance().
     #
-    # Approach: Try progressively simpler cmdlet calls, then fall back to pure WMI.
+    # Approach: Try multiple cmdlet variations (different parameter combos trigger
+    # different internal code paths), then CIM, then [wmiclass] COM interop.
     # ALL filter criteria and package assignment are applied via WMI afterward.
 
     $adr = $null
 
-    # --- Attempt 1: Minimal cmdlet (Name + CollectionId only) ---
-    # No filter criteria, no schedule - those trigger the null-key bug.
-    Write-Log "Creating ADR via cmdlet (minimal params: Name + CollectionId)..."
+    # --- Attempt 1: Cmdlet with CollectionName (different internal lookup path) ---
+    # CollectionName uses a name-based lookup internally. CollectionId uses an
+    # ID-based lookup. They hit different code paths in the cmdlet DLL.
+    Write-Log "Creating ADR via cmdlet (Name + CollectionName)..."
     try {
-        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
-        Write-Log "ADR created via cmdlet (minimal params)." -Level SUCCESS
+        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName -ErrorAction Stop
+        Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
     } catch {
-        Write-Log "Minimal cmdlet failed ($($_.Exception.Message))." -Level WARN
+        Write-Log "CollectionName cmdlet path failed ($($_.Exception.Message))." -Level WARN
     }
 
-    # --- Attempt 2: Cmdlet with Name only (CollectionId set via WMI) ---
+    # --- Attempt 2: Cmdlet with CollectionId ---
     if (-not $adr) {
-        Write-Log "Trying cmdlet with Name only..."
+        Write-Log "Trying cmdlet with CollectionId..."
         try {
-            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId 'SMS00001' -ErrorAction Stop
-            Write-Log "ADR created via cmdlet (Name + All Systems fallback collection)." -Level SUCCESS
+            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
+            Write-Log "ADR created via cmdlet (CollectionId path)." -Level SUCCESS
         } catch {
-            Write-Log "Name-only cmdlet also failed ($($_.Exception.Message)). Falling back to WMI..." -Level WARN
+            Write-Log "CollectionId cmdlet path failed ($($_.Exception.Message))." -Level WARN
         }
     }
 
-    # --- Attempt 3: Pure WMI creation ---
+    # --- Attempt 3: Cmdlet with UpdateClassification included ---
+    # The cmdlet may require UpdateClassification internally to avoid a null
+    # dictionary key when it builds the search criteria XML. Without it, the
+    # internal code tries to look up a null classification, causing the crash.
     if (-not $adr) {
+        Write-Log "Trying cmdlet with UpdateClassification included..."
         try {
-            Write-Log "Creating ADR via WMI (SMS_AutoDeploymentRule)..."
-            $wmiNS   = "root\SMS\site_$SiteCode"
-            $wmiConn = [System.Management.ManagementScope]::new("\\" + $SiteServer + "\" + $wmiNS)
-            $wmiConn.Connect()
-            $wmiPath = [System.Management.ManagementPath]::new("SMS_AutoDeploymentRule")
-            $mc      = [System.Management.ManagementClass]::new($wmiConn, $wmiPath, $null)
-            $newADR  = $mc.CreateInstance()
-            $newADR["Name"]                  = $Name
-            $newADR["Description"]           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-            $newADR["CollectionID"]          = $resolvedCollID
-            $newADR["AutoDeploymentEnabled"] = $true
+            $adr = New-CMAutoDeploymentRule -Name $Name `
+                                            -CollectionId $resolvedCollID `
+                                            -UpdateClassification $classifications `
+                                            -ErrorAction Stop
+            Write-Log "ADR created via cmdlet (with UpdateClassification)." -Level SUCCESS
+        } catch {
+            Write-Log "Cmdlet with classification also failed ($($_.Exception.Message))." -Level WARN
+        }
+    }
 
-            # ContentTemplate XML - required for WMI creation; tells the ADR where to
-            # store downloaded content and basic download settings.
-            $contentTemplate = @"
+    # --- Attempt 4: CIM-based creation ---
+    # CIM (WMI v2) uses a different provider pipeline than System.Management.
+    # Some classes that don't support old-style CreateInstance() work via CIM.
+    if (-not $adr) {
+        Write-Log "Trying CIM-based ADR creation (New-CimInstance)..."
+        $wmiNS = "root\SMS\site_$SiteCode"
+        try {
+            $cimSession = New-CimSession -ComputerName $SiteServer -ErrorAction Stop
+
+            # Build the ADR properties
+            $adrProperties = @{
+                Name                  = $Name
+                Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                CollectionID          = $resolvedCollID
+                AutoDeploymentEnabled = $true
+                ContentTemplate       = @"
 <ContentTemplate SchemaVersion="1.0">
   <ContentAction>
     <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
@@ -596,11 +613,7 @@ function New-WIMServicingADR {
   </ContentAction>
 </ContentTemplate>
 "@
-            $newADR["ContentTemplate"] = $contentTemplate
-
-            # DeploymentTemplate XML - required; controls how the ADR deploys updates.
-            # Since this is for download-only (WIM servicing), we use non-intrusive settings.
-            $deployTemplate = @"
+                DeploymentTemplate    = @"
 <DeploymentCreationActionXML SchemaVersion="1.0">
   <CollectionID>$resolvedCollID</CollectionID>
   <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
@@ -614,22 +627,78 @@ function New-WIMServicingADR {
   <EnableAlert>false</EnableAlert>
 </DeploymentCreationActionXML>
 "@
-            $newADR["DeploymentTemplate"] = $deployTemplate
+            }
 
-            $newADR.Put() | Out-Null
+            $newADR = New-CimInstance -Namespace $wmiNS `
+                                      -ClassName SMS_AutoDeploymentRule `
+                                      -Property $adrProperties `
+                                      -CimSession $cimSession `
+                                      -ErrorAction Stop
+
+            Write-Log "ADR created via CIM successfully." -Level SUCCESS
+            $adr = [PSCustomObject]@{ Name = $Name }
+
+            Remove-CimSession $cimSession -ErrorAction SilentlyContinue
+        } catch {
+            Write-Log "CIM creation failed ($($_.Exception.Message))." -Level WARN
+            Remove-CimSession $cimSession -ErrorAction SilentlyContinue
+        }
+    }
+
+    # --- Attempt 5: [wmiclass] COM interop with SpawnInstance_ ---
+    # Uses the native WMI COM API instead of .NET ManagementClass.
+    # SpawnInstance_ is a different entry point than CreateInstance().
+    if (-not $adr) {
+        Write-Log "Trying [wmiclass] COM interop (SpawnInstance_)..."
+        $wmiNS = "root\SMS\site_$SiteCode"
+        try {
+            $wmiClass = [wmiclass]"\\$SiteServer\${wmiNS}:SMS_AutoDeploymentRule"
+            $newADR   = $wmiClass.SpawnInstance_()
+            $newADR.Name                  = $Name
+            $newADR.Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+            $newADR.CollectionID          = $resolvedCollID
+            $newADR.AutoDeploymentEnabled = $true
+            $newADR.ContentTemplate       = @"
+<ContentTemplate SchemaVersion="1.0">
+  <ContentAction>
+    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
+    <DownloadFromInternet>true</DownloadFromInternet>
+    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
+  </ContentAction>
+</ContentTemplate>
+"@
+            $newADR.DeploymentTemplate    = @"
+<DeploymentCreationActionXML SchemaVersion="1.0">
+  <CollectionID>$resolvedCollID</CollectionID>
+  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
+  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
+  <UserNotificationOption>DisplayAll</UserNotificationOption>
+  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
+  <AllowRestart>false</AllowRestart>
+  <SuppressServers>Unchecked</SuppressServers>
+  <SuppressWorkstations>Unchecked</SuppressWorkstations>
+  <EnableWakeOnLan>false</EnableWakeOnLan>
+  <EnableAlert>false</EnableAlert>
+</DeploymentCreationActionXML>
+"@
+            $newADR.Put_() | Out-Null
 
             Start-Sleep -Seconds 3
 
             $adrWmiCheck = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
                                          -Class SMS_AutoDeploymentRule `
                                          -Filter "Name = '$Name'" -ErrorAction Stop
-            if (-not $adrWmiCheck) { throw "ADR not found in WMI after creation." }
+            if (-not $adrWmiCheck) { throw "ADR not found after WMI creation." }
 
-            Write-Log "ADR created via WMI successfully." -Level SUCCESS
+            Write-Log "ADR created via [wmiclass] COM interop." -Level SUCCESS
             $adr = [PSCustomObject]@{ Name = $Name }
         } catch {
-            throw "All ADR creation methods failed (cmdlet and WMI). Last error: $_`nCreate the ADR manually in the console and point it at package '$PkgName'."
+            Write-Log "[wmiclass] creation failed ($($_.Exception.Message))." -Level WARN
         }
+    }
+
+    if (-not $adr) {
+        throw "All ADR creation methods failed (cmdlet, CIM, and WMI).`nCreate the ADR manually in the console and point it at package '$PkgName'.`nCollection: $collectionName ($resolvedCollID)"
     }
 
     # --- Post-creation: apply ALL properties via WMI ---
