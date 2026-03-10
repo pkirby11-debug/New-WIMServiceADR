@@ -601,9 +601,11 @@ function New-WIMServicingADR {
     # SCCM before the error is thrown (the error could be in a post-creation step
     # like returning the object or setting up the schedule).
     #
-    # Key insight: Use -ErrorAction SilentlyContinue to let the cmdlet run to
-    # completion, then check WMI to see if the ADR was actually created despite
-    # the error. This avoids -ErrorAction Stop aborting the cmdlet mid-operation.
+    # IMPORTANT: -ErrorAction SilentlyContinue does NOT work here because the
+    # null-key error is a terminating .NET ArgumentNullException, not a PowerShell
+    # non-terminating error. It propagates regardless of ErrorAction preference.
+    # We MUST use try/catch, then check WMI to see if the ADR was created
+    # before the exception was thrown.
     #
     # ALL filter criteria and package assignment are applied via WMI afterward.
 
@@ -623,15 +625,13 @@ function New-WIMServicingADR {
         } catch { return $null }
     }
 
-    # --- Attempt 1: Cmdlet with CollectionName (SilentlyContinue + WMI check) ---
+    # --- Attempt 1: Cmdlet with CollectionName + WMI check ---
     Write-Log "Creating ADR via cmdlet (Name + CollectionName)..."
-    $cmdResult = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName `
-                                          -ErrorAction SilentlyContinue -ErrorVariable cmdErr
-    if ($cmdResult) {
-        $adr = $cmdResult
+    try {
+        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName -ErrorAction Stop
         Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
-    } elseif ($cmdErr) {
-        Write-Log "Cmdlet reported error ($($cmdErr[0].Exception.Message)) - checking if ADR was created anyway..." -Level WARN
+    } catch {
+        Write-Log "Cmdlet error: $($_.Exception.Message) - checking if ADR was created anyway..." -Level WARN
         $wmiCheck = Test-ADRCreatedInWMI
         if ($wmiCheck) {
             $adr = [PSCustomObject]@{ Name = $Name }
@@ -639,16 +639,14 @@ function New-WIMServicingADR {
         }
     }
 
-    # --- Attempt 2: Cmdlet with CollectionId + SilentlyContinue ---
+    # --- Attempt 2: Cmdlet with CollectionId + WMI check ---
     if (-not $adr) {
         Write-Log "Trying cmdlet with CollectionId..."
-        $cmdResult = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID `
-                                              -ErrorAction SilentlyContinue -ErrorVariable cmdErr
-        if ($cmdResult) {
-            $adr = $cmdResult
+        try {
+            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
             Write-Log "ADR created via cmdlet (CollectionId path)." -Level SUCCESS
-        } elseif ($cmdErr) {
-            Write-Log "CollectionId path error ($($cmdErr[0].Exception.Message)) - checking WMI..." -Level WARN
+        } catch {
+            Write-Log "CollectionId path error: $($_.Exception.Message) - checking WMI..." -Level WARN
             $wmiCheck = Test-ADRCreatedInWMI
             if ($wmiCheck) {
                 $adr = [PSCustomObject]@{ Name = $Name }
@@ -657,18 +655,17 @@ function New-WIMServicingADR {
         }
     }
 
-    # --- Attempt 3: Cmdlet with more params + SilentlyContinue ---
+    # --- Attempt 3: Cmdlet with UpdateClassification + WMI check ---
     if (-not $adr) {
         Write-Log "Trying cmdlet with UpdateClassification included..."
-        $cmdResult = New-CMAutoDeploymentRule -Name $Name `
-                                              -CollectionId $resolvedCollID `
-                                              -UpdateClassification $classifications `
-                                              -ErrorAction SilentlyContinue -ErrorVariable cmdErr
-        if ($cmdResult) {
-            $adr = $cmdResult
+        try {
+            $adr = New-CMAutoDeploymentRule -Name $Name `
+                                            -CollectionId $resolvedCollID `
+                                            -UpdateClassification $classifications `
+                                            -ErrorAction Stop
             Write-Log "ADR created via cmdlet (with UpdateClassification)." -Level SUCCESS
-        } elseif ($cmdErr) {
-            Write-Log "Classification path error ($($cmdErr[0].Exception.Message)) - checking WMI..." -Level WARN
+        } catch {
+            Write-Log "Classification path error: $($_.Exception.Message) - checking WMI..." -Level WARN
             $wmiCheck = Test-ADRCreatedInWMI
             if ($wmiCheck) {
                 $adr = [PSCustomObject]@{ Name = $Name }
@@ -676,43 +673,121 @@ function New-WIMServicingADR {
             }
         }
     }
+
+    # --- Build UpdateRuleXML for WMI/CIM/AdminService creation ---
+    # The SMS Provider REQUIRES UpdateRuleXML (search criteria) to create an ADR.
+    # Without it, creation is rejected with WBEM_E_FAILED (0x80041001).
+    $updateRuleXML = @"
+<AutoDeploymentRule>
+  <UpdateRuleProperties>
+    <Property PropertyName="_Product" Operator="In">
+      <Values><Value>$($OS.Product)</Value></Values>
+    </Property>
+    <Property PropertyName="_UpdateClassification" Operator="In">
+      <Values>
+        <Value>Security Updates</Value>
+        <Value>Critical Updates</Value>
+        <Value>Updates</Value>
+      </Values>
+    </Property>
+    <Property PropertyName="LocalizedDisplayName" Operator="Contains">
+      <Values><Value>$titleCriteria</Value></Values>
+    </Property>
+    <Property PropertyName="IsSuperseded" Operator="Equals">
+      <Values><Value>false</Value></Values>
+    </Property>
+    <Property PropertyName="IsExpired" Operator="Equals">
+      <Values><Value>false</Value></Values>
+    </Property>
+  </UpdateRuleProperties>
+</AutoDeploymentRule>
+"@
+    $contentTemplateXML = @"
+<ContentTemplate SchemaVersion="1.0">
+  <ContentAction>
+    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
+    <DownloadFromInternet>true</DownloadFromInternet>
+    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
+  </ContentAction>
+</ContentTemplate>
+"@
+    $deployTemplateXML = @"
+<DeploymentCreationActionXML SchemaVersion="1.0">
+  <CollectionID>$resolvedCollID</CollectionID>
+  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
+  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
+  <UserNotificationOption>DisplayAll</UserNotificationOption>
+  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
+  <AllowRestart>false</AllowRestart>
+  <SuppressServers>Unchecked</SuppressServers>
+  <SuppressWorkstations>Unchecked</SuppressWorkstations>
+  <EnableWakeOnLan>false</EnableWakeOnLan>
+  <EnableAlert>false</EnableAlert>
+</DeploymentCreationActionXML>
+"@
 
     # --- Attempt 4: AdminService REST API ---
     # ConfigMgr CB exposes a REST API (AdminService) on the SMS Provider.
     # This bypasses both the CM cmdlet DLL and raw WMI provider limitations.
     if (-not $adr) {
         Write-Log "Trying AdminService REST API..."
-        $adminSvcUrl = "https://$SiteServer/AdminService/wmi/$($script:ADRWmiClass)"
-        try {
-            $body = @{
-                Name         = $Name
-                Description  = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                CollectionID = $resolvedCollID
-            } | ConvertTo-Json -Depth 5
 
-            # Use default Windows credentials (Kerberos) for the AdminService
-            $response = Invoke-RestMethod -Uri $adminSvcUrl `
-                                          -Method Post `
-                                          -Body $body `
-                                          -ContentType 'application/json' `
-                                          -UseDefaultCredentials `
-                                          -ErrorAction Stop
+        # Try both common AdminService URL patterns
+        $adminSvcUrls = @(
+            "https://$SiteServer/AdminService/wmi/$($script:ADRWmiClass)",
+            "https://$SiteServer/AdminService/v1.0/$($script:ADRWmiClass)"
+        )
 
-            Write-Log "ADR created via AdminService REST API." -Level SUCCESS
-            $adr = [PSCustomObject]@{ Name = $Name }
-        } catch {
-            Write-Log "AdminService failed ($($_.Exception.Message))." -Level WARN
+        foreach ($adminSvcUrl in $adminSvcUrls) {
+            if ($adr) { break }
+            Write-Log "  Trying: $adminSvcUrl"
+            try {
+                # Skip certificate validation for internal SCCM servers
+                try {
+                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
+                } catch { }
+
+                $body = @{
+                    Name               = $Name
+                    Description        = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                    CollectionID       = $resolvedCollID
+                    UpdateRuleXML      = $updateRuleXML
+                    ContentTemplate    = $contentTemplateXML
+                    DeploymentTemplate = $deployTemplateXML
+                } | ConvertTo-Json -Depth 5
+
+                $response = Invoke-RestMethod -Uri $adminSvcUrl `
+                                              -Method Post `
+                                              -Body $body `
+                                              -ContentType 'application/json' `
+                                              -UseDefaultCredentials `
+                                              -ErrorAction Stop
+
+                Write-Log "ADR created via AdminService REST API." -Level SUCCESS
+                $adr = [PSCustomObject]@{ Name = $Name }
+            } catch {
+                Write-Log "  AdminService URL failed ($($_.Exception.Message))." -Level WARN
+            } finally {
+                try {
+                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
+                } catch { }
+            }
         }
     }
 
-    # --- Attempt 5: CIM-based creation with minimal properties ---
+    # --- Attempt 5: CIM-based creation with full properties ---
     if (-not $adr -and $script:ADRWmiClass) {
-        Write-Log "Trying CIM-based ADR creation (minimal properties)..."
+        Write-Log "Trying CIM-based ADR creation (full properties including UpdateRuleXML)..."
         try {
             $cimSession = New-CimSession -ComputerName $SiteServer -ErrorAction Stop
             $adrProperties = @{
-                Name         = $Name
-                CollectionID = $resolvedCollID
+                Name                  = $Name
+                Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                CollectionID          = $resolvedCollID
+                AutoDeploymentEnabled = $true
+                UpdateRuleXML         = $updateRuleXML
+                ContentTemplate       = $contentTemplateXML
+                DeploymentTemplate    = $deployTemplateXML
             }
             $newADR = New-CimInstance -Namespace $wmiNS `
                                       -ClassName $script:ADRWmiClass `
@@ -729,7 +804,6 @@ function New-WIMServicingADR {
     }
 
     # --- Attempt 6: .NET ManagementClass with CreateInstance() ---
-    # Uses the correct .NET method name (not COM SpawnInstance_)
     if (-not $adr -and $script:ADRWmiClass) {
         Write-Log "Trying .NET ManagementClass.CreateInstance()..."
         try {
@@ -738,8 +812,12 @@ function New-WIMServicingADR {
             $mPath   = [System.Management.ManagementPath]::new($script:ADRWmiClass)
             $mc      = [System.Management.ManagementClass]::new($scope, $mPath, $null)
             $newADR  = $mc.CreateInstance()
-            $newADR["Name"]         = $Name
-            $newADR["CollectionID"] = $resolvedCollID
+            $newADR["Name"]               = $Name
+            $newADR["Description"]        = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+            $newADR["CollectionID"]       = $resolvedCollID
+            $newADR["UpdateRuleXML"]      = $updateRuleXML
+            $newADR["ContentTemplate"]    = $contentTemplateXML
+            $newADR["DeploymentTemplate"] = $deployTemplateXML
             $newADR.Put() | Out-Null
 
             Start-Sleep -Seconds 3
