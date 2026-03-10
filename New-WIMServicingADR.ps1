@@ -492,8 +492,10 @@ function New-WIMServicingADR {
         }
     }
     if ($existing) {
-        Write-Log "ADR '$Name' already exists. Skipping creation." -Level WARN
-        return $existing
+        Write-Log "ADR '$Name' already exists. Skipping creation, will reconfigure properties." -Level WARN
+        $adrAlreadyExists = $true
+    } else {
+        $adrAlreadyExists = $false
     }
 
     Write-Log "Building ADR property criteria..."
@@ -596,16 +598,23 @@ function New-WIMServicingADR {
 
     Write-Log "  Title criteria: $titleCriteria"
 
+    $adr = $null
+    $wmiNS = "root\SMS\site_$SiteCode"
+
+    # If ADR already exists (e.g. created manually or from previous run), skip straight to configuration
+    if ($adrAlreadyExists) {
+        $adr = [PSCustomObject]@{ Name = $Name }
+        Write-Log "Using existing ADR for property configuration."
+    }
+
     # Strategy: The CM cmdlet New-CMAutoDeploymentRule has a null-key bug.
     # We try:
     #   1. New-CMSoftwareUpdateAutoDeploymentRule (full cmdlet name, different code path)
     #   2. New-CMAutoDeploymentRule (alias, multiple parameter combos)
     #   3. WMI creation using XML templates cloned from an existing ADR
     #   4. WMI creation with resolved SCCM category GUIDs in the XML
+    #   5. Guided manual creation (user creates in console, script polls and configures)
     # After each cmdlet attempt, check WMI to see if ADR was partially created.
-
-    $adr = $null
-    $wmiNS = "root\SMS\site_$SiteCode"
 
     # Helper: check if ADR exists in WMI after a cmdlet attempt
     function Test-ADRCreatedInWMI {
@@ -622,6 +631,7 @@ function New-WIMServicingADR {
     # --- Attempt 1: New-CMSoftwareUpdateAutoDeploymentRule (full cmdlet name) ---
     # This is the actual cmdlet name; New-CMAutoDeploymentRule may be an alias
     # that routes through different (bugged) code paths.
+    if (-not $adr) {
     Write-Log "Creating ADR via New-CMSoftwareUpdateAutoDeploymentRule..."
     try {
         $cmdletExists = Get-Command New-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
@@ -642,6 +652,7 @@ function New-WIMServicingADR {
             Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
         }
     }
+    } # end Attempt 1 guard
 
     # --- Attempt 2: New-CMAutoDeploymentRule with CollectionName ---
     if (-not $adr) {
@@ -871,8 +882,55 @@ $classMatchRules
         }
     }
 
+    # --- Fallback: Guided manual creation ---
+    # If all programmatic methods failed, guide the user to create a minimal ADR
+    # in the SCCM console, then detect it and configure all properties via WMI.
     if (-not $adr) {
-        throw "All ADR creation methods failed (cmdlet, CIM, and WMI).`nCreate the ADR manually in the console and point it at package '$PkgName'.`nCollection: $collectionName ($resolvedCollID)"
+        Write-Log "============================================================" -Level WARN
+        Write-Log "All programmatic ADR creation methods failed." -Level WARN
+        Write-Log "This is a known issue with certain ConfigMgr console versions." -Level WARN
+        Write-Log "============================================================" -Level WARN
+        Write-Log ""
+        Write-Log "Please create a MINIMAL ADR manually in the SCCM console:" -Level WARN
+        Write-Log ""
+        Write-Log "  1. Open the SCCM console"
+        Write-Log "  2. Go to: Software Library > Software Updates > Automatic Deployment Rules"
+        Write-Log "  3. Right-click > Create Automatic Deployment Rule"
+        Write-Log "  4. Set ONLY these values:"
+        Write-Log "       Name       : $Name"
+        Write-Log "       Collection : $collectionName ($resolvedCollID)"
+        Write-Log "       Template   : (any - we will reconfigure via script)"
+        Write-Log "  5. Click through the wizard with defaults and finish"
+        Write-Log ""
+        Write-Log "The script will detect the ADR and configure all properties automatically."
+        Write-Log "============================================================" -Level WARN
+
+        # Poll WMI for the ADR to appear (wait up to 10 minutes)
+        $waitSeconds = 600
+        $pollInterval = 15
+        $elapsed = 0
+        Write-Log "Waiting for ADR '$Name' to appear in WMI (timeout: $($waitSeconds / 60) minutes)..."
+        Write-Log "Press Ctrl+C to cancel if you want to create it later."
+
+        while ($elapsed -lt $waitSeconds) {
+            $wmiCheck = Test-ADRCreatedInWMI
+            if ($wmiCheck) {
+                $adr = [PSCustomObject]@{ Name = $Name }
+                Write-Log "ADR '$Name' detected in WMI!" -Level SUCCESS
+                break
+            }
+            Start-Sleep -Seconds $pollInterval
+            $elapsed += $pollInterval
+            if (($elapsed % 60) -eq 0) {
+                Write-Log "  Still waiting... ($($elapsed / 60) of $($waitSeconds / 60) minutes elapsed)"
+            }
+        }
+
+        if (-not $adr) {
+            Write-Log "Timed out waiting for ADR. You can re-run this script after creating the ADR manually." -Level ERROR
+            Write-Log "When re-run, the script will detect the existing ADR and skip to configuration." -Level ERROR
+            throw "ADR '$Name' was not created within the timeout period."
+        }
     }
 
     # --- Post-creation: apply ALL properties via WMI ---
