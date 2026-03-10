@@ -596,24 +596,18 @@ function New-WIMServicingADR {
 
     Write-Log "  Title criteria: $titleCriteria"
 
-    # Strategy: The CM cmdlet has a null-key bug that triggers on every call in
-    # some console versions. However, the cmdlet may actually CREATE the ADR in
-    # SCCM before the error is thrown (the error could be in a post-creation step
-    # like returning the object or setting up the schedule).
-    #
-    # IMPORTANT: -ErrorAction SilentlyContinue does NOT work here because the
-    # null-key error is a terminating .NET ArgumentNullException, not a PowerShell
-    # non-terminating error. It propagates regardless of ErrorAction preference.
-    # We MUST use try/catch, then check WMI to see if the ADR was created
-    # before the exception was thrown.
-    #
-    # ALL filter criteria and package assignment are applied via WMI afterward.
+    # Strategy: The CM cmdlet New-CMAutoDeploymentRule has a null-key bug.
+    # We try:
+    #   1. New-CMSoftwareUpdateAutoDeploymentRule (full cmdlet name, different code path)
+    #   2. New-CMAutoDeploymentRule (alias, multiple parameter combos)
+    #   3. WMI creation using XML templates cloned from an existing ADR
+    #   4. WMI creation with resolved SCCM category GUIDs in the XML
+    # After each cmdlet attempt, check WMI to see if ADR was partially created.
 
     $adr = $null
     $wmiNS = "root\SMS\site_$SiteCode"
 
     # Helper: check if ADR exists in WMI after a cmdlet attempt
-    # The cmdlet may create the ADR but then throw on a post-creation step
     function Test-ADRCreatedInWMI {
         if (-not $script:ADRWmiClass) { return $null }
         try {
@@ -625,13 +619,23 @@ function New-WIMServicingADR {
         } catch { return $null }
     }
 
-    # --- Attempt 1: Cmdlet with CollectionName + WMI check ---
-    Write-Log "Creating ADR via cmdlet (Name + CollectionName)..."
+    # --- Attempt 1: New-CMSoftwareUpdateAutoDeploymentRule (full cmdlet name) ---
+    # This is the actual cmdlet name; New-CMAutoDeploymentRule may be an alias
+    # that routes through different (bugged) code paths.
+    Write-Log "Creating ADR via New-CMSoftwareUpdateAutoDeploymentRule..."
     try {
-        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName -ErrorAction Stop
-        Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
+        $cmdletExists = Get-Command New-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
+        if ($cmdletExists) {
+            $adr = New-CMSoftwareUpdateAutoDeploymentRule -Name $Name `
+                                                          -CollectionId $resolvedCollID `
+                                                          -DeploymentPackageName $PkgName `
+                                                          -ErrorAction Stop
+            Write-Log "ADR created via New-CMSoftwareUpdateAutoDeploymentRule." -Level SUCCESS
+        } else {
+            Write-Log "Cmdlet New-CMSoftwareUpdateAutoDeploymentRule not available." -Level WARN
+        }
     } catch {
-        Write-Log "Cmdlet error: $($_.Exception.Message) - checking if ADR was created anyway..." -Level WARN
+        Write-Log "Full cmdlet name failed: $($_.Exception.Message) - checking WMI..." -Level WARN
         $wmiCheck = Test-ADRCreatedInWMI
         if ($wmiCheck) {
             $adr = [PSCustomObject]@{ Name = $Name }
@@ -639,14 +643,30 @@ function New-WIMServicingADR {
         }
     }
 
-    # --- Attempt 2: Cmdlet with CollectionId + WMI check ---
+    # --- Attempt 2: New-CMAutoDeploymentRule with CollectionName ---
+    if (-not $adr) {
+        Write-Log "Trying New-CMAutoDeploymentRule (Name + CollectionName)..."
+        try {
+            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName -ErrorAction Stop
+            Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
+        } catch {
+            Write-Log "Cmdlet error: $($_.Exception.Message) - checking WMI..." -Level WARN
+            $wmiCheck = Test-ADRCreatedInWMI
+            if ($wmiCheck) {
+                $adr = [PSCustomObject]@{ Name = $Name }
+                Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
+            }
+        }
+    }
+
+    # --- Attempt 3: New-CMAutoDeploymentRule with CollectionId ---
     if (-not $adr) {
         Write-Log "Trying cmdlet with CollectionId..."
         try {
             $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
             Write-Log "ADR created via cmdlet (CollectionId path)." -Level SUCCESS
         } catch {
-            Write-Log "CollectionId path error: $($_.Exception.Message) - checking WMI..." -Level WARN
+            Write-Log "CollectionId error: $($_.Exception.Message) - checking WMI..." -Level WARN
             $wmiCheck = Test-ADRCreatedInWMI
             if ($wmiCheck) {
                 $adr = [PSCustomObject]@{ Name = $Name }
@@ -655,89 +675,137 @@ function New-WIMServicingADR {
         }
     }
 
-    # --- Attempt 3: Cmdlet with UpdateClassification + WMI check ---
-    if (-not $adr) {
-        Write-Log "Trying cmdlet with UpdateClassification included..."
+    # --- Attempt 4: WMI creation using cloned XML from an existing ADR ---
+    # This is the most reliable non-cmdlet approach: copy templates from a
+    # working ADR and modify just the values that differ.
+    if (-not $adr -and $script:ADRWmiClass) {
+        $templateSource = $null
+        Write-Log "Looking for existing ADR to clone XML templates from..."
         try {
-            $adr = New-CMAutoDeploymentRule -Name $Name `
-                                            -CollectionId $resolvedCollID `
-                                            -UpdateClassification $classifications `
-                                            -ErrorAction Stop
-            Write-Log "ADR created via cmdlet (with UpdateClassification)." -Level SUCCESS
-        } catch {
-            Write-Log "Classification path error: $($_.Exception.Message) - checking WMI..." -Level WARN
-            $wmiCheck = Test-ADRCreatedInWMI
-            if ($wmiCheck) {
-                $adr = [PSCustomObject]@{ Name = $Name }
-                Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
-            }
-        }
-    }
-
-    # --- Build XML templates for WMI/CIM/AdminService creation ---
-    # The SMS Provider requires ALL FOUR XML properties to create an ADR:
-    #   1. ContentTemplate (root: ContentActionXML)
-    #   2. DeploymentTemplate (root: TemplateDescription)
-    #   3. UpdateRuleXML (root: UpdateXML with UpdateXMLDescriptionItems)
-    #   4. AutoDeploymentProperties (search criteria XML)
-    # Getting ANY of these wrong or missing causes "Generic failure" on Put().
-    #
-    # Best approach: copy XML from an existing ADR on the server and modify it.
-    # Fallback: use correctly-structured XML templates.
-
-    $templateSource = $null
-    if ($script:ADRWmiClass) {
-        Write-Log "Looking for existing ADR to use as XML template source..."
-        try {
-            $existingADRs = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
-                                          -Class $script:ADRWmiClass `
-                                          -ErrorAction SilentlyContinue
-            if ($existingADRs) {
-                # Pick the first ADR that has all XML properties populated
-                $candidates = @($existingADRs)
-                foreach ($candidate in $candidates) {
-                    if ($candidate.ContentTemplate -and $candidate.DeploymentTemplate -and $candidate.UpdateRuleXML) {
-                        $templateSource = $candidate
-                        Write-Log "Found template source ADR: '$($candidate.Name)'" -Level SUCCESS
-                        break
-                    }
+            $existingADRs = @(Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                            -Class $script:ADRWmiClass `
+                                            -ErrorAction SilentlyContinue)
+            foreach ($candidate in $existingADRs) {
+                if ($candidate.ContentTemplate -and $candidate.DeploymentTemplate -and $candidate.UpdateRuleXML) {
+                    $templateSource = $candidate
+                    Write-Log "Found template source ADR: '$($candidate.Name)'" -Level SUCCESS
+                    break
                 }
             }
         } catch {
-            Write-Log "Template source search failed (non-fatal): $_" -Level WARN
+            Write-Log "Template source search failed: $_" -Level WARN
+        }
+
+        if ($templateSource) {
+            Write-Log "Cloning XML templates and creating ADR via WMI..."
+            try {
+                # Clone ContentTemplate - swap PackageId
+                [xml]$ctXml = $templateSource.ContentTemplate
+                $pkgNode = $ctXml.SelectSingleNode('//PackageId')
+                if (-not $pkgNode) { $pkgNode = $ctXml.SelectSingleNode('//PackageID') }
+                if ($pkgNode -and $resolvedPkgID) { $pkgNode.InnerText = $resolvedPkgID }
+                $clonedContentTemplate = $ctXml.OuterXml
+
+                # Clone DeploymentTemplate - swap CollectionId
+                [xml]$dtXml = $templateSource.DeploymentTemplate
+                $collNode = $dtXml.SelectSingleNode('//CollectionId')
+                if (-not $collNode) { $collNode = $dtXml.SelectSingleNode('//CollectionID') }
+                if ($collNode) { $collNode.InnerText = $resolvedCollID }
+                $clonedDeployTemplate = $dtXml.OuterXml
+
+                $scope  = [System.Management.ManagementScope]::new("\\$SiteServer\$wmiNS")
+                $scope.Connect()
+                $mPath  = [System.Management.ManagementPath]::new($script:ADRWmiClass)
+                $mc     = [System.Management.ManagementClass]::new($scope, $mPath, $null)
+                $newADR = $mc.CreateInstance()
+                $newADR["Name"]                      = $Name
+                $newADR["Description"]               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                $newADR["CollectionID"]              = $resolvedCollID
+                $newADR["AutoDeploymentEnabled"]     = $true
+                $newADR["ContentTemplate"]           = $clonedContentTemplate
+                $newADR["DeploymentTemplate"]        = $clonedDeployTemplate
+                $newADR["UpdateRuleXML"]             = $templateSource.UpdateRuleXML
+                $newADR["AutoDeploymentProperties"]  = if ($templateSource.AutoDeploymentProperties) { $templateSource.AutoDeploymentProperties } else { '' }
+                $newADR.Put() | Out-Null
+
+                Start-Sleep -Seconds 3
+                $adrWmiCheck = Test-ADRCreatedInWMI
+                if ($adrWmiCheck) {
+                    Write-Log "ADR created via WMI (cloned templates)." -Level SUCCESS
+                    $adr = [PSCustomObject]@{ Name = $Name }
+                } else {
+                    throw "ADR not found in WMI after cloned creation."
+                }
+            } catch {
+                Write-Log "Cloned WMI creation failed: $($_.Exception.Message)" -Level WARN
+            }
+        } else {
+            Write-Log "No existing ADR found to clone templates from." -Level WARN
         }
     }
 
-    if ($templateSource) {
-        # Clone XML from existing ADR and modify the relevant values
-        Write-Log "Cloning XML templates from existing ADR..."
+    # --- Attempt 5: WMI creation with resolved SCCM category GUIDs ---
+    # The UpdateRuleXML likely needs CI_UniqueID GUIDs, not display names.
+    # Resolve them from SMS_CIAllCategories.
+    if (-not $adr -and $script:ADRWmiClass) {
+        Write-Log "Resolving SCCM category GUIDs for WMI creation..."
+        try {
+            # Resolve Product GUID
+            $productGUID = $null
+            $prodCat = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                     -Class SMS_CIAllCategories `
+                                     -Filter "LocalizedCategoryInstanceName = '$($OS.Product)' AND CategoryTypeName = 'Product'" `
+                                     -ErrorAction SilentlyContinue
+            if ($prodCat) {
+                $productGUID = $prodCat.CategoryInstance_UniqueID
+                Write-Log "  Product GUID: $productGUID"
+            }
 
-        # ContentTemplate - replace PackageId
-        [xml]$ctXml = $templateSource.ContentTemplate
-        $pkgNode = $ctXml.SelectSingleNode('//PackageId')
-        if (-not $pkgNode) { $pkgNode = $ctXml.SelectSingleNode('//PackageID') }
-        if ($pkgNode -and $resolvedPkgID) { $pkgNode.InnerText = $resolvedPkgID }
-        $contentTemplateXML = $ctXml.OuterXml
+            # Resolve Classification GUIDs
+            $classGUIDs = @()
+            foreach ($classif in $classifications) {
+                $classCat = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                          -Class SMS_CIAllCategories `
+                                          -Filter "LocalizedCategoryInstanceName = '$classif' AND CategoryTypeName = 'UpdateClassification'" `
+                                          -ErrorAction SilentlyContinue
+                if ($classCat) {
+                    $classGUIDs += $classCat.CategoryInstance_UniqueID
+                    Write-Log "  Classification GUID for '$classif': $($classCat.CategoryInstance_UniqueID)"
+                }
+            }
 
-        # DeploymentTemplate - replace CollectionId
-        [xml]$dtXml = $templateSource.DeploymentTemplate
-        $collNode = $dtXml.SelectSingleNode('//CollectionId')
-        if (-not $collNode) { $collNode = $dtXml.SelectSingleNode('//CollectionID') }
-        if ($collNode) { $collNode.InnerText = $resolvedCollID }
-        $deployTemplateXML = $dtXml.OuterXml
+            if ($productGUID -and $classGUIDs.Count -gt 0) {
+                Write-Log "Building UpdateRuleXML with resolved GUIDs..."
 
-        # UpdateRuleXML - use as-is for initial creation; we'll overwrite criteria via
-        # Set-WIMServicingADRProperties after creation
-        $updateRuleXML = $templateSource.UpdateRuleXML
-
-        # AutoDeploymentProperties - use as-is; will be overwritten after creation
-        $autoDeployProps = $templateSource.AutoDeploymentProperties
-
-    } else {
-        Write-Log "No existing ADR found for template. Building XML from scratch..." -Level WARN
-
-        # ContentTemplate - must use <ContentActionXML> root element
-        $contentTemplateXML = @"
+                # Build UpdateRuleXML with GUIDs
+                $classMatchRules = ($classGUIDs | ForEach-Object { "        <string>$_</string>" }) -join "`n"
+                $updateRuleXML = @"
+<UpdateXML>
+  <UpdateXMLDescriptionItems>
+    <UpdateXMLDescriptionItem PropertyName="_Product" UIPropertyName="Products">
+      <MatchRules>
+        <string>$productGUID</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="_UpdateClassification" UIPropertyName="UpdateClassification">
+      <MatchRules>
+$classMatchRules
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="IsSuperseded" UIPropertyName="Superseded">
+      <MatchRules>
+        <string>false</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+    <UpdateXMLDescriptionItem PropertyName="IsExpired" UIPropertyName="Expired">
+      <MatchRules>
+        <string>false</string>
+      </MatchRules>
+    </UpdateXMLDescriptionItem>
+  </UpdateXMLDescriptionItems>
+</UpdateXML>
+"@
+                $contentTemplateXML = @"
 <ContentActionXML>
   <PackageId>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageId>
   <DownloadFromInternet>true</DownloadFromInternet>
@@ -745,9 +813,7 @@ function New-WIMServicingADR {
   <ContentLocales><Locale>Locale:9</Locale><Locale>Locale:0</Locale></ContentLocales>
 </ContentActionXML>
 "@
-
-        # DeploymentTemplate - must use <TemplateDescription> root element
-        $deployTemplateXML = @"
+                $deployTemplateXML = @"
 <TemplateDescription xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance" xmlns:xsd="http://www.w3.org/2001/XMLSchema">
   <CollectionId>$resolvedCollID</CollectionId>
   <IncludeSub>true</IncludeSub>
@@ -769,174 +835,39 @@ function New-WIMServicingADR {
   <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
   <UserNotification>DisplayAll</UserNotification>
   <AllowSoftwareInstallationOutOfWindow>false</AllowSoftwareInstallationOutOfWindow>
-  <AllowRestart>false</AllowRestart>
   <SoftDeadlineEnabled>true</SoftDeadlineEnabled>
   <RequirePostRebootFullScan>false</RequirePostRebootFullScan>
   <EnableAlert>false</EnableAlert>
 </TemplateDescription>
 "@
+                $scope  = [System.Management.ManagementScope]::new("\\$SiteServer\$wmiNS")
+                $scope.Connect()
+                $mPath  = [System.Management.ManagementPath]::new($script:ADRWmiClass)
+                $mc     = [System.Management.ManagementClass]::new($scope, $mPath, $null)
+                $newADR = $mc.CreateInstance()
+                $newADR["Name"]                     = $Name
+                $newADR["Description"]              = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                $newADR["CollectionID"]             = $resolvedCollID
+                $newADR["AutoDeploymentEnabled"]    = $true
+                $newADR["ContentTemplate"]          = $contentTemplateXML
+                $newADR["DeploymentTemplate"]       = $deployTemplateXML
+                $newADR["UpdateRuleXML"]            = $updateRuleXML
+                $newADR["AutoDeploymentProperties"] = ''
+                $newADR.Put() | Out-Null
 
-        # UpdateRuleXML - must use <UpdateXML> with <UpdateXMLDescriptionItems>
-        # The PropertyName values use underscore prefix for SCCM category properties
-        $updateRuleXML = @"
-<UpdateXML>
-  <UpdateXMLDescriptionItems>
-    <UpdateXMLDescriptionItem PropertyName="_Product" UIPropertyName="Products">
-      <MatchRules>
-        <string>$($OS.Product)</string>
-      </MatchRules>
-    </UpdateXMLDescriptionItem>
-    <UpdateXMLDescriptionItem PropertyName="_UpdateClassification" UIPropertyName="UpdateClassification">
-      <MatchRules>
-        <string>Security Updates</string>
-        <string>Critical Updates</string>
-        <string>Updates</string>
-      </MatchRules>
-    </UpdateXMLDescriptionItem>
-    <UpdateXMLDescriptionItem PropertyName="LocalizedDisplayName" UIPropertyName="Title">
-      <MatchRules>
-        <string>%$titleCriteria%</string>
-      </MatchRules>
-    </UpdateXMLDescriptionItem>
-    <UpdateXMLDescriptionItem PropertyName="IsSuperseded" UIPropertyName="Superseded">
-      <MatchRules>
-        <string>false</string>
-      </MatchRules>
-    </UpdateXMLDescriptionItem>
-    <UpdateXMLDescriptionItem PropertyName="IsExpired" UIPropertyName="Expired">
-      <MatchRules>
-        <string>false</string>
-      </MatchRules>
-    </UpdateXMLDescriptionItem>
-  </UpdateXMLDescriptionItems>
-</UpdateXML>
-"@
-
-        # AutoDeploymentProperties - the search/evaluation criteria blob
-        $autoDeployProps = @"
-<AutoDeploymentRule>
-  <SearchCriteria>
-    <Products><Value>$($OS.Product)</Value></Products>
-    <UpdateClassifications>
-      <Value>Security Updates</Value>
-      <Value>Critical Updates</Value>
-      <Value>Updates</Value>
-    </UpdateClassifications>
-  </SearchCriteria>
-  <EvaluationSchedule>None</EvaluationSchedule>
-</AutoDeploymentRule>
-"@
-    }
-
-    # --- Attempt 4: AdminService REST API ---
-    # ConfigMgr CB exposes a REST API (AdminService) on the SMS Provider.
-    # This bypasses both the CM cmdlet DLL and raw WMI provider limitations.
-    if (-not $adr) {
-        Write-Log "Trying AdminService REST API..."
-
-        # Try both common AdminService URL patterns
-        $adminSvcUrls = @(
-            "https://$SiteServer/AdminService/wmi/$($script:ADRWmiClass)",
-            "https://$SiteServer/AdminService/v1.0/$($script:ADRWmiClass)"
-        )
-
-        foreach ($adminSvcUrl in $adminSvcUrls) {
-            if ($adr) { break }
-            Write-Log "  Trying: $adminSvcUrl"
-            try {
-                # Skip certificate validation for internal SCCM servers
-                try {
-                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = { $true }
-                } catch { }
-
-                $body = @{
-                    Name                      = $Name
-                    Description               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                    CollectionID              = $resolvedCollID
-                    UpdateRuleXML             = $updateRuleXML
-                    ContentTemplate           = $contentTemplateXML
-                    DeploymentTemplate        = $deployTemplateXML
-                    AutoDeploymentProperties  = $autoDeployProps
-                    AutoDeploymentEnabled     = $true
-                } | ConvertTo-Json -Depth 5
-
-                $response = Invoke-RestMethod -Uri $adminSvcUrl `
-                                              -Method Post `
-                                              -Body $body `
-                                              -ContentType 'application/json' `
-                                              -UseDefaultCredentials `
-                                              -ErrorAction Stop
-
-                Write-Log "ADR created via AdminService REST API." -Level SUCCESS
-                $adr = [PSCustomObject]@{ Name = $Name }
-            } catch {
-                Write-Log "  AdminService URL failed ($($_.Exception.Message))." -Level WARN
-            } finally {
-                try {
-                    [System.Net.ServicePointManager]::ServerCertificateValidationCallback = $null
-                } catch { }
-            }
-        }
-    }
-
-    # --- Attempt 5: CIM-based creation with full properties ---
-    if (-not $adr -and $script:ADRWmiClass) {
-        Write-Log "Trying CIM-based ADR creation (full properties including UpdateRuleXML)..."
-        try {
-            $cimSession = New-CimSession -ComputerName $SiteServer -ErrorAction Stop
-            $adrProperties = @{
-                Name                      = $Name
-                Description               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                CollectionID              = $resolvedCollID
-                AutoDeploymentEnabled     = $true
-                UpdateRuleXML             = $updateRuleXML
-                ContentTemplate           = $contentTemplateXML
-                DeploymentTemplate        = $deployTemplateXML
-                AutoDeploymentProperties  = $autoDeployProps
-            }
-            $newADR = New-CimInstance -Namespace $wmiNS `
-                                      -ClassName $script:ADRWmiClass `
-                                      -Property $adrProperties `
-                                      -CimSession $cimSession `
-                                      -ErrorAction Stop
-            Write-Log "ADR created via CIM." -Level SUCCESS
-            $adr = [PSCustomObject]@{ Name = $Name }
-            Remove-CimSession $cimSession -ErrorAction SilentlyContinue
-        } catch {
-            Write-Log "CIM creation failed ($($_.Exception.Message))." -Level WARN
-            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
-        }
-    }
-
-    # --- Attempt 6: .NET ManagementClass with CreateInstance() ---
-    if (-not $adr -and $script:ADRWmiClass) {
-        Write-Log "Trying .NET ManagementClass.CreateInstance()..."
-        try {
-            $scope   = [System.Management.ManagementScope]::new("\\$SiteServer\$wmiNS")
-            $scope.Connect()
-            $mPath   = [System.Management.ManagementPath]::new($script:ADRWmiClass)
-            $mc      = [System.Management.ManagementClass]::new($scope, $mPath, $null)
-            $newADR  = $mc.CreateInstance()
-            $newADR["Name"]                      = $Name
-            $newADR["Description"]               = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-            $newADR["CollectionID"]              = $resolvedCollID
-            $newADR["AutoDeploymentEnabled"]     = $true
-            $newADR["UpdateRuleXML"]             = $updateRuleXML
-            $newADR["ContentTemplate"]           = $contentTemplateXML
-            $newADR["DeploymentTemplate"]        = $deployTemplateXML
-            $newADR["AutoDeploymentProperties"]  = $autoDeployProps
-            $newADR.Put() | Out-Null
-
-            Start-Sleep -Seconds 3
-            $adrWmiCheck = Test-ADRCreatedInWMI
-            if ($adrWmiCheck) {
-                Write-Log "ADR created via .NET ManagementClass." -Level SUCCESS
-                $adr = [PSCustomObject]@{ Name = $Name }
+                Start-Sleep -Seconds 3
+                $adrWmiCheck = Test-ADRCreatedInWMI
+                if ($adrWmiCheck) {
+                    Write-Log "ADR created via WMI (GUID-based XML)." -Level SUCCESS
+                    $adr = [PSCustomObject]@{ Name = $Name }
+                } else {
+                    throw "ADR not found in WMI after GUID-based creation."
+                }
             } else {
-                throw "ADR not found in WMI after ManagementClass creation."
+                Write-Log "Could not resolve all category GUIDs (Product: $($productGUID -ne $null), Classifications: $($classGUIDs.Count))." -Level WARN
             }
         } catch {
-            Write-Log ".NET ManagementClass creation failed ($($_.Exception.Message))." -Level WARN
+            Write-Log "GUID-based WMI creation failed: $($_.Exception.Message)" -Level WARN
         }
     }
 
