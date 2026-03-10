@@ -597,159 +597,161 @@ function New-WIMServicingADR {
     Write-Log "  Title criteria: $titleCriteria"
 
     # Strategy: The CM cmdlet has a null-key bug that triggers on every call in
-    # some console versions. Even Name + CollectionId alone fails.
-    # The ADR WMI class does not support direct WMI CreateInstance().
+    # some console versions. However, the cmdlet may actually CREATE the ADR in
+    # SCCM before the error is thrown (the error could be in a post-creation step
+    # like returning the object or setting up the schedule).
     #
-    # Approach: Try multiple cmdlet variations (different parameter combos trigger
-    # different internal code paths), then CIM, then [wmiclass] COM interop.
+    # Key insight: Use -ErrorAction SilentlyContinue to let the cmdlet run to
+    # completion, then check WMI to see if the ADR was actually created despite
+    # the error. This avoids -ErrorAction Stop aborting the cmdlet mid-operation.
+    #
     # ALL filter criteria and package assignment are applied via WMI afterward.
 
     $adr = $null
+    $wmiNS = "root\SMS\site_$SiteCode"
 
-    # --- Attempt 1: Cmdlet with CollectionName (different internal lookup path) ---
-    # CollectionName uses a name-based lookup internally. CollectionId uses an
-    # ID-based lookup. They hit different code paths in the cmdlet DLL.
-    Write-Log "Creating ADR via cmdlet (Name + CollectionName)..."
-    try {
-        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName -ErrorAction Stop
-        Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
-    } catch {
-        Write-Log "CollectionName cmdlet path failed ($($_.Exception.Message))." -Level WARN
+    # Helper: check if ADR exists in WMI after a cmdlet attempt
+    # The cmdlet may create the ADR but then throw on a post-creation step
+    function Test-ADRCreatedInWMI {
+        if (-not $script:ADRWmiClass) { return $null }
+        try {
+            $check = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                   -Class $script:ADRWmiClass `
+                                   -Filter "Name = '$Name'" `
+                                   -ErrorAction SilentlyContinue
+            return $check
+        } catch { return $null }
     }
 
-    # --- Attempt 2: Cmdlet with CollectionId ---
+    # --- Attempt 1: Cmdlet with CollectionName (SilentlyContinue + WMI check) ---
+    Write-Log "Creating ADR via cmdlet (Name + CollectionName)..."
+    $cmdResult = New-CMAutoDeploymentRule -Name $Name -CollectionName $collectionName `
+                                          -ErrorAction SilentlyContinue -ErrorVariable cmdErr
+    if ($cmdResult) {
+        $adr = $cmdResult
+        Write-Log "ADR created via cmdlet (CollectionName path)." -Level SUCCESS
+    } elseif ($cmdErr) {
+        Write-Log "Cmdlet reported error ($($cmdErr[0].Exception.Message)) - checking if ADR was created anyway..." -Level WARN
+        $wmiCheck = Test-ADRCreatedInWMI
+        if ($wmiCheck) {
+            $adr = [PSCustomObject]@{ Name = $Name }
+            Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
+        }
+    }
+
+    # --- Attempt 2: Cmdlet with CollectionId + SilentlyContinue ---
     if (-not $adr) {
         Write-Log "Trying cmdlet with CollectionId..."
-        try {
-            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
+        $cmdResult = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID `
+                                              -ErrorAction SilentlyContinue -ErrorVariable cmdErr
+        if ($cmdResult) {
+            $adr = $cmdResult
             Write-Log "ADR created via cmdlet (CollectionId path)." -Level SUCCESS
-        } catch {
-            Write-Log "CollectionId cmdlet path failed ($($_.Exception.Message))." -Level WARN
+        } elseif ($cmdErr) {
+            Write-Log "CollectionId path error ($($cmdErr[0].Exception.Message)) - checking WMI..." -Level WARN
+            $wmiCheck = Test-ADRCreatedInWMI
+            if ($wmiCheck) {
+                $adr = [PSCustomObject]@{ Name = $Name }
+                Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
+            }
         }
     }
 
-    # --- Attempt 3: Cmdlet with UpdateClassification included ---
-    # The cmdlet may require UpdateClassification internally to avoid a null
-    # dictionary key when it builds the search criteria XML. Without it, the
-    # internal code tries to look up a null classification, causing the crash.
+    # --- Attempt 3: Cmdlet with more params + SilentlyContinue ---
     if (-not $adr) {
         Write-Log "Trying cmdlet with UpdateClassification included..."
-        try {
-            $adr = New-CMAutoDeploymentRule -Name $Name `
-                                            -CollectionId $resolvedCollID `
-                                            -UpdateClassification $classifications `
-                                            -ErrorAction Stop
+        $cmdResult = New-CMAutoDeploymentRule -Name $Name `
+                                              -CollectionId $resolvedCollID `
+                                              -UpdateClassification $classifications `
+                                              -ErrorAction SilentlyContinue -ErrorVariable cmdErr
+        if ($cmdResult) {
+            $adr = $cmdResult
             Write-Log "ADR created via cmdlet (with UpdateClassification)." -Level SUCCESS
-        } catch {
-            Write-Log "Cmdlet with classification also failed ($($_.Exception.Message))." -Level WARN
+        } elseif ($cmdErr) {
+            Write-Log "Classification path error ($($cmdErr[0].Exception.Message)) - checking WMI..." -Level WARN
+            $wmiCheck = Test-ADRCreatedInWMI
+            if ($wmiCheck) {
+                $adr = [PSCustomObject]@{ Name = $Name }
+                Write-Log "ADR WAS created despite cmdlet error! Found in WMI." -Level SUCCESS
+            }
         }
     }
 
-    # --- Attempt 4: CIM-based creation ---
-    # CIM (WMI v2) uses a different provider pipeline than System.Management.
-    # Some classes that don't support old-style CreateInstance() work via CIM.
+    # --- Attempt 4: AdminService REST API ---
+    # ConfigMgr CB exposes a REST API (AdminService) on the SMS Provider.
+    # This bypasses both the CM cmdlet DLL and raw WMI provider limitations.
+    if (-not $adr) {
+        Write-Log "Trying AdminService REST API..."
+        $adminSvcUrl = "https://$SiteServer/AdminService/wmi/$($script:ADRWmiClass)"
+        try {
+            $body = @{
+                Name         = $Name
+                Description  = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+                CollectionID = $resolvedCollID
+            } | ConvertTo-Json -Depth 5
+
+            # Use default Windows credentials (Kerberos) for the AdminService
+            $response = Invoke-RestMethod -Uri $adminSvcUrl `
+                                          -Method Post `
+                                          -Body $body `
+                                          -ContentType 'application/json' `
+                                          -UseDefaultCredentials `
+                                          -ErrorAction Stop
+
+            Write-Log "ADR created via AdminService REST API." -Level SUCCESS
+            $adr = [PSCustomObject]@{ Name = $Name }
+        } catch {
+            Write-Log "AdminService failed ($($_.Exception.Message))." -Level WARN
+        }
+    }
+
+    # --- Attempt 5: CIM-based creation with minimal properties ---
     if (-not $adr -and $script:ADRWmiClass) {
-        Write-Log "Trying CIM-based ADR creation (New-CimInstance)..."
-        $wmiNS = "root\SMS\site_$SiteCode"
+        Write-Log "Trying CIM-based ADR creation (minimal properties)..."
         try {
             $cimSession = New-CimSession -ComputerName $SiteServer -ErrorAction Stop
-
-            # Build the ADR properties
             $adrProperties = @{
-                Name                  = $Name
-                Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                CollectionID          = $resolvedCollID
-                AutoDeploymentEnabled = $true
-                ContentTemplate       = @"
-<ContentTemplate SchemaVersion="1.0">
-  <ContentAction>
-    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
-    <DownloadFromInternet>true</DownloadFromInternet>
-    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
-  </ContentAction>
-</ContentTemplate>
-"@
-                DeploymentTemplate    = @"
-<DeploymentCreationActionXML SchemaVersion="1.0">
-  <CollectionID>$resolvedCollID</CollectionID>
-  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
-  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
-  <UserNotificationOption>DisplayAll</UserNotificationOption>
-  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
-  <AllowRestart>false</AllowRestart>
-  <SuppressServers>Unchecked</SuppressServers>
-  <SuppressWorkstations>Unchecked</SuppressWorkstations>
-  <EnableWakeOnLan>false</EnableWakeOnLan>
-  <EnableAlert>false</EnableAlert>
-</DeploymentCreationActionXML>
-"@
+                Name         = $Name
+                CollectionID = $resolvedCollID
             }
-
             $newADR = New-CimInstance -Namespace $wmiNS `
                                       -ClassName $script:ADRWmiClass `
                                       -Property $adrProperties `
                                       -CimSession $cimSession `
                                       -ErrorAction Stop
-
-            Write-Log "ADR created via CIM successfully." -Level SUCCESS
+            Write-Log "ADR created via CIM." -Level SUCCESS
             $adr = [PSCustomObject]@{ Name = $Name }
-
             Remove-CimSession $cimSession -ErrorAction SilentlyContinue
         } catch {
             Write-Log "CIM creation failed ($($_.Exception.Message))." -Level WARN
-            Remove-CimSession $cimSession -ErrorAction SilentlyContinue
+            if ($cimSession) { Remove-CimSession $cimSession -ErrorAction SilentlyContinue }
         }
     }
 
-    # --- Attempt 5: [wmiclass] COM interop with SpawnInstance_ ---
-    # Uses the native WMI COM API instead of .NET ManagementClass.
-    # SpawnInstance_ is a different entry point than CreateInstance().
+    # --- Attempt 6: .NET ManagementClass with CreateInstance() ---
+    # Uses the correct .NET method name (not COM SpawnInstance_)
     if (-not $adr -and $script:ADRWmiClass) {
-        Write-Log "Trying [wmiclass] COM interop (SpawnInstance_)..."
-        $wmiNS = "root\SMS\site_$SiteCode"
+        Write-Log "Trying .NET ManagementClass.CreateInstance()..."
         try {
-            $wmiClass = [wmiclass]"\\$SiteServer\${wmiNS}:$($script:ADRWmiClass)"
-            $newADR   = $wmiClass.SpawnInstance_()
-            $newADR.Name                  = $Name
-            $newADR.Description           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-            $newADR.CollectionID          = $resolvedCollID
-            $newADR.AutoDeploymentEnabled = $true
-            $newADR.ContentTemplate       = @"
-<ContentTemplate SchemaVersion="1.0">
-  <ContentAction>
-    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
-    <DownloadFromInternet>true</DownloadFromInternet>
-    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
-  </ContentAction>
-</ContentTemplate>
-"@
-            $newADR.DeploymentTemplate    = @"
-<DeploymentCreationActionXML SchemaVersion="1.0">
-  <CollectionID>$resolvedCollID</CollectionID>
-  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
-  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
-  <UserNotificationOption>DisplayAll</UserNotificationOption>
-  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
-  <AllowRestart>false</AllowRestart>
-  <SuppressServers>Unchecked</SuppressServers>
-  <SuppressWorkstations>Unchecked</SuppressWorkstations>
-  <EnableWakeOnLan>false</EnableWakeOnLan>
-  <EnableAlert>false</EnableAlert>
-</DeploymentCreationActionXML>
-"@
-            $newADR.Put_() | Out-Null
+            $scope   = [System.Management.ManagementScope]::new("\\$SiteServer\$wmiNS")
+            $scope.Connect()
+            $mPath   = [System.Management.ManagementPath]::new($script:ADRWmiClass)
+            $mc      = [System.Management.ManagementClass]::new($scope, $mPath, $null)
+            $newADR  = $mc.CreateInstance()
+            $newADR["Name"]         = $Name
+            $newADR["CollectionID"] = $resolvedCollID
+            $newADR.Put() | Out-Null
 
             Start-Sleep -Seconds 3
-
-            $adrWmiCheck = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
-                                         -Class $script:ADRWmiClass `
-                                         -Filter "Name = '$Name'" -ErrorAction Stop
-            if (-not $adrWmiCheck) { throw "ADR not found after WMI creation." }
-
-            Write-Log "ADR created via [wmiclass] COM interop." -Level SUCCESS
-            $adr = [PSCustomObject]@{ Name = $Name }
+            $adrWmiCheck = Test-ADRCreatedInWMI
+            if ($adrWmiCheck) {
+                Write-Log "ADR created via .NET ManagementClass." -Level SUCCESS
+                $adr = [PSCustomObject]@{ Name = $Name }
+            } else {
+                throw "ADR not found in WMI after ManagementClass creation."
+            }
         } catch {
-            Write-Log "[wmiclass] creation failed ($($_.Exception.Message))." -Level WARN
+            Write-Log ".NET ManagementClass creation failed ($($_.Exception.Message))." -Level WARN
         }
     }
 
