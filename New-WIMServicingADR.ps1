@@ -442,6 +442,13 @@ function New-WIMServicingADR {
 
     Write-Log "Building ADR property criteria..."
 
+    # Validate critical parameters before any cmdlet/WMI calls
+    if (-not $Name)         { throw "ADR Name is null or empty." }
+    if (-not $OS)           { throw "OS info hashtable is null." }
+    if (-not $OS.Product)   { throw "OS Product is null - check OSMap for '$Name'." }
+    if (-not $OS.TitleFilter) { throw "OS TitleFilter is null - check OSMap." }
+    if (-not $Arch)         { throw "Architecture is null or empty." }
+
     # Build the update classification list
     $classifications = @('Security Updates', 'Critical Updates', 'Updates')
 
@@ -463,6 +470,7 @@ function New-WIMServicingADR {
     # New-CMSchedule throws the same null-key bug as other CM cmdlets in some console
     # versions, so wrap it with fallbacks rather than letting it propagate as FATAL.
     $cmSchedule = $null
+    $scheduleToken = $null
     try {
         $cmSchedule = New-CMSchedule -Start $Schedule -RecurInterval Days -RecurCount 35 -ErrorAction Stop
         Write-Log "ADR schedule object created (35-day recurrence)."
@@ -472,7 +480,12 @@ function New-WIMServicingADR {
             $cmSchedule = New-CMSchedule -Start $Schedule -Nonrecurring -ErrorAction Stop
             Write-Log "ADR schedule object created (non-recurring; set recurrence manually in console)." -Level WARN
         } catch {
-            Write-Log "New-CMSchedule failed entirely (non-fatal). ADR will be created without a schedule - set it manually in the console." -Level WARN
+            Write-Log "New-CMSchedule cmdlet unavailable. Generating schedule token directly..." -Level WARN
+            # Build a simple SMS schedule token for the start date.
+            # Format: SMS_ST_NonRecurring encoded as a date string that SCCM can parse.
+            # We'll apply the full schedule via WMI after ADR creation.
+            $scheduleToken = $Schedule.ToUniversalTime().ToString('yyyyMMddHHmmss') + '.000000+***'
+            Write-Log "Generated schedule token: $scheduleToken"
         }
     }
 
@@ -520,29 +533,6 @@ function New-WIMServicingADR {
         throw "Collection '$collectionName' not found. Verify the collection exists in SCCM and the name matches exactly."
     }
 
-    # Core ADR parameters - only include params confirmed valid across CM CB versions.
-    # DeploymentPackageName omitted: triggers null-key bug (set via WMI after creation).
-    # NoDeployment omitted: not a valid parameter in this console version.
-    # SoftwareUpdateGroupName omitted: not a valid parameter in this console version.
-    # CollectionName omitted: triggers null-key bug; CollectionId used instead.
-    # Schedule only included when successfully created above.
-    $adrParams = @{
-        Name                             = $Name
-        Description                      = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName). Managed by New-WIMServicingADR.ps1."
-        CollectionId                     = $resolvedCollID
-        AddToExistingSoftwareUpdateGroup = $false
-        EnabledAfterCreate               = $true
-        RunType                          = 'RunTheRuleOnSchedule'
-        DeployWithoutLicense             = $true
-        Product                          = $OS.Product
-        UpdateClassification             = $classifications
-        Architecture                     = $Arch
-        Language                         = 'English'
-        DownloadFromInternet             = $true
-        AvailableImmediately             = $true
-    }
-    if ($cmSchedule) { $adrParams['Schedule'] = $cmSchedule }
-
     # Title filter - scopes to the correct OS version
     # Format matches how WSUS/SCCM stores CU titles:
     # "YYYY-MM Cumulative Update for Windows 11 Version 24H2 for x64-based Systems (KB...)"
@@ -550,93 +540,140 @@ function New-WIMServicingADR {
 
     Write-Log "  Title criteria: $titleCriteria"
 
+    # Strategy: The CM cmdlet has a null-key bug that triggers when filter criteria
+    # parameters (Product, UpdateClassification, Architecture, Language) are passed.
+    # Even CollectionId can trigger it in some versions.
+    #
+    # Approach: Try progressively simpler cmdlet calls, then fall back to pure WMI.
+    # ALL filter criteria and package assignment are applied via WMI afterward.
+
+    $adr = $null
+
+    # --- Attempt 1: Minimal cmdlet (Name + CollectionId only) ---
+    # No filter criteria, no schedule - those trigger the null-key bug.
+    Write-Log "Creating ADR via cmdlet (minimal params: Name + CollectionId)..."
     try {
-        $adr = New-CMAutoDeploymentRule @adrParams
+        $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId $resolvedCollID -ErrorAction Stop
+        Write-Log "ADR created via cmdlet (minimal params)." -Level SUCCESS
+    } catch {
+        Write-Log "Minimal cmdlet failed ($($_.Exception.Message))." -Level WARN
+    }
 
-        # Assign deployment package via WMI (bypasses null-key cmdlet bug)
-        Set-ADRPackageViaWMI -ADRName $Name -PackageID $resolvedPkgID
+    # --- Attempt 2: Cmdlet with Name only (CollectionId set via WMI) ---
+    if (-not $adr) {
+        Write-Log "Trying cmdlet with Name only..."
+        try {
+            $adr = New-CMAutoDeploymentRule -Name $Name -CollectionId 'SMS00001' -ErrorAction Stop
+            Write-Log "ADR created via cmdlet (Name + All Systems fallback collection)." -Level SUCCESS
+        } catch {
+            Write-Log "Name-only cmdlet also failed ($($_.Exception.Message)). Falling back to WMI..." -Level WARN
+        }
+    }
 
-        # Apply title filter and full criteria via WMI
+    # --- Attempt 3: Pure WMI creation ---
+    if (-not $adr) {
+        try {
+            Write-Log "Creating ADR via WMI (SMS_AutoDeploymentRule)..."
+            $wmiNS   = "root\SMS\site_$SiteCode"
+            $wmiConn = [System.Management.ManagementScope]::new("\\" + $SiteServer + "\" + $wmiNS)
+            $wmiConn.Connect()
+            $wmiPath = [System.Management.ManagementPath]::new("SMS_AutoDeploymentRule")
+            $mc      = [System.Management.ManagementClass]::new($wmiConn, $wmiPath, $null)
+            $newADR  = $mc.CreateInstance()
+            $newADR["Name"]                  = $Name
+            $newADR["Description"]           = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
+            $newADR["CollectionID"]          = $resolvedCollID
+            $newADR["AutoDeploymentEnabled"] = $true
+
+            # ContentTemplate XML - required for WMI creation; tells the ADR where to
+            # store downloaded content and basic download settings.
+            $contentTemplate = @"
+<ContentTemplate SchemaVersion="1.0">
+  <ContentAction>
+    <PackageID>$(if ($resolvedPkgID) { $resolvedPkgID } else { '' })</PackageID>
+    <DownloadFromInternet>true</DownloadFromInternet>
+    <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
+  </ContentAction>
+</ContentTemplate>
+"@
+            $newADR["ContentTemplate"] = $contentTemplate
+
+            # DeploymentTemplate XML - required; controls how the ADR deploys updates.
+            # Since this is for download-only (WIM servicing), we use non-intrusive settings.
+            $deployTemplate = @"
+<DeploymentCreationActionXML SchemaVersion="1.0">
+  <CollectionID>$resolvedCollID</CollectionID>
+  <AvailableDateTimeIsUTC>false</AvailableDateTimeIsUTC>
+  <DeadlineDateTimeIsUTC>false</DeadlineDateTimeIsUTC>
+  <UserNotificationOption>DisplayAll</UserNotificationOption>
+  <AllowSoftwareInstallationOutsideWindow>false</AllowSoftwareInstallationOutsideWindow>
+  <AllowRestart>false</AllowRestart>
+  <SuppressServers>Unchecked</SuppressServers>
+  <SuppressWorkstations>Unchecked</SuppressWorkstations>
+  <EnableWakeOnLan>false</EnableWakeOnLan>
+  <EnableAlert>false</EnableAlert>
+</DeploymentCreationActionXML>
+"@
+            $newADR["DeploymentTemplate"] = $deployTemplate
+
+            $newADR.Put() | Out-Null
+
+            Start-Sleep -Seconds 3
+
+            $adrWmiCheck = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
+                                         -Class SMS_AutoDeploymentRule `
+                                         -Filter "Name = '$Name'" -ErrorAction Stop
+            if (-not $adrWmiCheck) { throw "ADR not found in WMI after creation." }
+
+            Write-Log "ADR created via WMI successfully." -Level SUCCESS
+            $adr = [PSCustomObject]@{ Name = $Name }
+        } catch {
+            throw "All ADR creation methods failed (cmdlet and WMI). Last error: $_`nCreate the ADR manually in the console and point it at package '$PkgName'."
+        }
+    }
+
+    # --- Post-creation: apply ALL properties via WMI ---
+    # This is the safest path - the cmdlet only creates the shell ADR,
+    # and WMI handles filter criteria, package, and schedule assignment.
+    Write-Log "Applying ADR properties via WMI (package, filters, schedule)..."
+
+    Set-ADRPackageViaWMI -ADRName $Name -PackageID $resolvedPkgID
+
+    # Fix collection ID if we used the fallback 'SMS00001' collection
+    Set-ADRCollectionViaWMI -ADRName $Name -CollectionID $resolvedCollID
+
+    Set-WIMServicingADRProperties -ADRName $Name -OS $OS -Arch $Arch `
+                                  -DotNet $DotNet -Schedule $Schedule `
+                                  -TitleCriteria $titleCriteria `
+                                  -ScheduleToken $scheduleToken
+
+    Write-Log "ADR created and configured successfully." -Level SUCCESS
+    return $adr
+}
+
+function Set-ADRCollectionViaWMI {
+    # Ensures the ADR targets the correct collection via WMI.
+    # Used when the cmdlet required a fallback collection during creation.
+    param(
+        [string]$ADRName,
+        [string]$CollectionID
+    )
+
+    if (-not $CollectionID) { return }
+
+    try {
         $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                 -ComputerName $SiteServer `
                                 -Class SMS_AutoDeploymentRule `
-                                -Filter "Name = '$Name'"
-
-        if ($adrWmi) {
-            [xml]$criteriaXml = $adrWmi.AutoDeploymentProperties
-
-            $titleNode = $criteriaXml.CreateElement('UpdateLocalization')
-            $propNode  = $criteriaXml.CreateElement('Property')
-            $propNode.SetAttribute('PropertyName', 'Title')
-            $propNode.SetAttribute('Operator', 'Contains')
-            $propNode.SetAttribute('Value', $titleCriteria)
-            $titleNode.AppendChild($propNode) | Out-Null
-
-            if ($criteriaXml.AutoDeploymentCriteria) {
-                $criteriaXml.AutoDeploymentCriteria.AppendChild($titleNode) | Out-Null
-            }
-
-            $adrWmi.AutoDeploymentProperties = $criteriaXml.OuterXml
+                                -Filter "Name = '$ADRName'" `
+                                -ErrorAction Stop
+        if ($adrWmi -and $adrWmi.CollectionID -ne $CollectionID) {
+            $adrWmi.CollectionID = $CollectionID
             $adrWmi.Put() | Out-Null
-            Write-Log "Title filter applied via WMI." -Level SUCCESS
+            Write-Log "Collection ID set to '$CollectionID' via WMI." -Level SUCCESS
         }
-
-        Write-Log "ADR created successfully." -Level SUCCESS
-        return $adr
-
     } catch {
-        # New-CMAutoDeploymentRule doesn't support all params in older console versions.
-        # Strip back to absolutely minimal params and apply everything else via WMI.
-        Write-Log "Full ADR creation failed ($($_.Exception.Message)). Trying minimal creation..." -Level WARN
-
-        $minParams = @{
-            Name         = $Name
-            CollectionId = $resolvedCollID
-        }
-        $adr = $null
-        try {
-            $adr = New-CMAutoDeploymentRule @minParams -ErrorAction Stop
-            Write-Log "Minimal ADR created via cmdlet."
-        } catch {
-            Write-Log "Minimal cmdlet also failed ($($_.Exception.Message)). Creating ADR via WMI directly..." -Level WARN
-        }
-
-        # WMI direct creation - same pattern as the successful package WMI fallback
-        if (-not $adr) {
-            try {
-                Write-Log "Creating ADR via WMI (SMS_AutoDeploymentRule)..."
-                $wmiNS   = "root\SMS\site_$SiteCode"
-                $wmiConn = [System.Management.ManagementScope]::new("\\" + $SiteServer + "\" + $wmiNS)
-                $wmiConn.Connect()
-                $wmiPath = [System.Management.ManagementPath]::new("SMS_AutoDeploymentRule")
-                $mc      = [System.Management.ManagementClass]::new($wmiConn, $wmiPath, $null)
-                $newADR  = $mc.CreateInstance()
-                $newADR["Name"]                 = $Name
-                $newADR["Description"]          = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                $newADR["CollectionID"]         = $resolvedCollID
-                $newADR["AutoDeploymentEnabled"] = $true
-                $newADR.Put() | Out-Null
-
-                Start-Sleep -Seconds 3
-
-                $adrWmiCheck = Get-WmiObject -Namespace $wmiNS -ComputerName $SiteServer `
-                                             -Class SMS_AutoDeploymentRule `
-                                             -Filter "Name = '$Name'" -ErrorAction Stop
-                if (-not $adrWmiCheck) { throw "ADR not found in WMI after creation." }
-
-                Write-Log "ADR created via WMI successfully." -Level SUCCESS
-                $adr = [PSCustomObject]@{ Name = $Name }
-            } catch {
-                throw "All ADR creation methods failed. Last error: $_`nCreate the ADR manually in the console and point it at package '$PkgName'."
-            }
-        }
-
-        Write-Log "Applying all ADR properties via WMI..."
-        Set-ADRPackageViaWMI -ADRName $Name -PackageID $resolvedPkgID
-        Set-WIMServicingADRProperties -ADRName $Name -OS $OS -Arch $Arch `
-                                      -DotNet $DotNet -Schedule $Schedule `
-                                      -TitleCriteria $titleCriteria
-        return $adr
+        Write-Log "WMI collection assignment failed (non-fatal, set manually in console): $_" -Level WARN
     }
 }
 
@@ -675,14 +712,15 @@ function Set-ADRPackageViaWMI {
 
 function Set-WIMServicingADRProperties {
     # Applies full filter criteria directly via WMI for cases where
-    # the PowerShell cmdlet doesn't expose all parameters
+    # the PowerShell cmdlet doesn't expose all parameters or triggers null-key bugs
     param(
         [string]$ADRName,
         [hashtable]$OS,
         [string]$Arch,
         [bool]$DotNet,
         [datetime]$Schedule,
-        [string]$TitleCriteria
+        [string]$TitleCriteria,
+        [string]$ScheduleToken = $null
     )
 
     Write-Log "Applying ADR filter properties via WMI for: $ADRName"
@@ -753,8 +791,26 @@ function Set-WIMServicingADRProperties {
         $adrWmi.Put() | Out-Null
         Write-Log "ADR filter criteria applied via WMI." -Level SUCCESS
     } catch {
-        Write-Log "WMI property update failed: $_" -Level WARN
+        Write-Log "WMI criteria update failed: $_" -Level WARN
         Write-Log "You may need to manually configure ADR filter criteria in the console." -Level WARN
+    }
+
+    # Apply schedule via WMI if the cmdlet-based schedule failed
+    if ($ScheduleToken) {
+        try {
+            # Re-fetch to avoid stale object
+            $adrWmi2 = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
+                                     -ComputerName $SiteServer `
+                                     -Class SMS_AutoDeploymentRule `
+                                     -Filter "Name = '$ADRName'"
+            if ($adrWmi2) {
+                $adrWmi2.Schedule = $ScheduleToken
+                $adrWmi2.Put() | Out-Null
+                Write-Log "Schedule token applied via WMI." -Level SUCCESS
+            }
+        } catch {
+            Write-Log "WMI schedule assignment failed (non-fatal, set manually in console): $_" -Level WARN
+        }
     }
 }
 
