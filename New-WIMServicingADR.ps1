@@ -938,7 +938,7 @@ $classMatchRules
     # and WMI handles filter criteria, package, and schedule assignment.
     Write-Log "Applying ADR properties via WMI (package, filters, schedule)..."
 
-    Set-ADRPackageViaWMI -ADRName $Name -PackageID $resolvedPkgID
+    Set-ADRPackageViaWMI -ADRName $Name -PackageID $resolvedPkgID -PackageName $PkgName
 
     # Fix collection ID if we used the fallback 'SMS00001' collection
     Set-ADRCollectionViaWMI -ADRName $Name -CollectionID $resolvedCollID
@@ -962,127 +962,127 @@ function Set-ADRCollectionViaWMI {
 
     if (-not $CollectionID) { return }
 
+    # Use Set cmdlet - raw WMI Put() causes "Generic failure" on SMS_AutoDeployment
+    # The Set cmdlet only has -CollectionName, so resolve the name from the ID.
+    try {
+        $setCmdlet = Get-Command Set-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
+        if (-not $setCmdlet) {
+            $setCmdlet = Get-Command Set-CMAutoDeploymentRule -ErrorAction SilentlyContinue
+        }
+        if ($setCmdlet) {
+            # Resolve collection name from ID
+            $collObj = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
+                                     -ComputerName $SiteServer `
+                                     -Class SMS_Collection `
+                                     -Filter "CollectionID = '$CollectionID'" `
+                                     -ErrorAction SilentlyContinue
+            if ($collObj) {
+                & $setCmdlet.Name -Name $ADRName -CollectionName $collObj.Name -ErrorAction Stop
+                Write-Log "Collection set to '$($collObj.Name)' ($CollectionID) via cmdlet." -Level SUCCESS
+                return
+            }
+        }
+    } catch {
+        Write-Log "Cmdlet collection assignment failed: $($_.Exception.Message)" -Level WARN
+    }
+
+    # Fallback: try raw WMI
     try {
         $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
                                 -ComputerName $SiteServer `
                                 -Class $script:ADRWmiClass `
                                 -Filter "Name = '$ADRName'" `
                                 -ErrorAction Stop
-        if (-not $adrWmi) { return }
-
-        $needsPut = $false
-
-        # Update CollectionID direct property
-        if ($adrWmi.CollectionID -ne $CollectionID) {
+        if ($adrWmi -and $adrWmi.CollectionID -ne $CollectionID) {
             $adrWmi.CollectionID = $CollectionID
-            $needsPut = $true
-        }
-
-        # Also update CollectionId inside DeploymentTemplate XML
-        $existingDT = $adrWmi.DeploymentTemplate
-        if ($existingDT) {
-            try {
-                [xml]$dtXml = $existingDT
-                $collNode = $dtXml.SelectSingleNode('//CollectionId')
-                if (-not $collNode) { $collNode = $dtXml.SelectSingleNode('//CollectionID') }
-                if ($collNode -and $collNode.InnerText -ne $CollectionID) {
-                    $collNode.InnerText = $CollectionID
-                    $adrWmi.DeploymentTemplate = $dtXml.OuterXml
-                    $needsPut = $true
-                }
-            } catch {
-                Write-Log "Could not update DeploymentTemplate XML (non-fatal): $_" -Level WARN
-            }
-        }
-
-        if ($needsPut) {
             $adrWmi.Put() | Out-Null
             Write-Log "Collection ID set to '$CollectionID' via WMI." -Level SUCCESS
         } else {
             Write-Log "Collection ID already correct: $CollectionID"
         }
     } catch {
-        Write-Log "WMI collection assignment failed (non-fatal, set manually in console): $_" -Level WARN
+        Write-Log "WMI collection assignment also failed (non-fatal): $_" -Level WARN
     }
 }
 
 function Set-ADRPackageViaWMI {
-    # Links a deployment package to an ADR by updating the ContentTemplate XML.
-    # PackageID is NOT a direct property on SMS_AutoDeployment - it lives inside
-    # the ContentTemplate XML blob as <PackageId>.
+    # Links a deployment package to an ADR using the Set cmdlet.
+    # Raw WMI Put() causes "Generic failure" on SMS_AutoDeployment objects,
+    # so we use Set-CMSoftwareUpdateAutoDeploymentRule -DeploymentPackageName instead.
     param(
         [string]$ADRName,
-        [string]$PackageID
+        [string]$PackageID,
+        [string]$PackageName
     )
 
-    if (-not $PackageID) {
-        Write-Log "No package ID available - skipping WMI package assignment. Set it manually in the ADR properties." -Level WARN
+    if (-not $PackageID -and -not $PackageName) {
+        Write-Log "No package ID or name available - skipping package assignment. Set it manually in ADR properties." -Level WARN
         return
     }
 
-    Write-Log "Assigning package '$PackageID' to ADR '$ADRName' via ContentTemplate XML..."
-    try {
-        $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
-                                -ComputerName $SiteServer `
-                                -Class $script:ADRWmiClass `
-                                -Filter "Name = '$ADRName'" `
-                                -ErrorAction Stop
-        if (-not $adrWmi) {
-            Write-Log "ADR WMI object not found for package assignment - set it manually." -Level WARN
-            return
-        }
+    Write-Log "Assigning package to ADR '$ADRName'..."
 
-        # Read the existing ContentTemplate XML and inject/update PackageId
-        $existingCT = $adrWmi.ContentTemplate
-        if ($existingCT) {
-            try {
+    # Approach 1: Use Set cmdlet with -DeploymentPackageName
+    if ($PackageName) {
+        try {
+            $setCmdlet = Get-Command Set-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
+            if (-not $setCmdlet) {
+                $setCmdlet = Get-Command Set-CMAutoDeploymentRule -ErrorAction SilentlyContinue
+            }
+            if ($setCmdlet) {
+                & $setCmdlet.Name -Name $ADRName -DeploymentPackageName $PackageName -ErrorAction Stop
+                Write-Log "Package '$PackageName' linked to ADR via cmdlet." -Level SUCCESS
+                return
+            }
+        } catch {
+            Write-Log "Cmdlet package assignment failed: $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    # Approach 2: Try WMI ContentTemplate XML update as fallback
+    if ($PackageID) {
+        try {
+            $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
+                                    -ComputerName $SiteServer `
+                                    -Class $script:ADRWmiClass `
+                                    -Filter "Name = '$ADRName'" `
+                                    -ErrorAction Stop
+            if (-not $adrWmi) {
+                Write-Log "ADR WMI object not found for package assignment." -Level WARN
+                return
+            }
+
+            $existingCT = $adrWmi.ContentTemplate
+            if ($existingCT) {
                 [xml]$ctXml = $existingCT
                 $pkgNode = $ctXml.SelectSingleNode('//PackageId')
                 if (-not $pkgNode) { $pkgNode = $ctXml.SelectSingleNode('//PackageID') }
                 if ($pkgNode) {
                     $pkgNode.InnerText = $PackageID
                 } else {
-                    # Add PackageId element to root
                     $root = $ctXml.DocumentElement
                     $newNode = $ctXml.CreateElement('PackageId')
                     $newNode.InnerText = $PackageID
                     $root.AppendChild($newNode) | Out-Null
                 }
                 $adrWmi.ContentTemplate = $ctXml.OuterXml
-            } catch {
-                Write-Log "Could not parse existing ContentTemplate XML, replacing entirely..." -Level WARN
-                $adrWmi.ContentTemplate = @"
-<ContentActionXML>
-  <PackageId>$PackageID</PackageId>
-  <DownloadFromInternet>true</DownloadFromInternet>
-  <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
-  <ContentLocales><Locale>Locale:9</Locale><Locale>Locale:0</Locale></ContentLocales>
-</ContentActionXML>
-"@
+                $adrWmi.Put() | Out-Null
+                Write-Log "Package '$PackageID' linked to ADR via ContentTemplate XML." -Level SUCCESS
+                return
             }
-        } else {
-            # No ContentTemplate exists yet - create from scratch
-            $adrWmi.ContentTemplate = @"
-<ContentActionXML>
-  <PackageId>$PackageID</PackageId>
-  <DownloadFromInternet>true</DownloadFromInternet>
-  <DownloadFromMicrosoftUpdate>true</DownloadFromMicrosoftUpdate>
-  <ContentLocales><Locale>Locale:9</Locale><Locale>Locale:0</Locale></ContentLocales>
-</ContentActionXML>
-"@
+        } catch {
+            Write-Log "WMI package assignment also failed: $($_.Exception.Message)" -Level WARN
         }
-        $adrWmi.Put() | Out-Null
-        Write-Log "Package '$PackageID' linked to ADR via ContentTemplate XML." -Level SUCCESS
-    } catch {
-        Write-Log "WMI package assignment failed (non-fatal, set manually in console): $_" -Level WARN
     }
+
+    Write-Log "Could not assign package automatically. Set it manually in the ADR properties:" -Level WARN
+    Write-Log "  Right-click ADR > Properties > Software Updates > Deployment Package" -Level WARN
 }
 
 function Set-WIMServicingADRProperties {
-    # Configures an existing ADR's filter criteria, collection, and schedule via WMI.
-    # For manually-created ADRs, reads the existing XML properties and modifies them
-    # in-place to preserve the SMS Provider's expected format. For properties that
-    # can't be modified in-place, uses Set-CMAutoDeploymentRule cmdlet as a fallback.
+    # Configures an existing ADR's filter criteria using Set-CMSoftwareUpdateAutoDeploymentRule.
+    # The Set cmdlet uses typed parameters (-Product, -UpdateClassification, -Title, etc.)
+    # rather than raw XML, which avoids the "Generic failure" from WMI Put().
     param(
         [string]$ADRName,
         [hashtable]$OS,
@@ -1095,95 +1095,66 @@ function Set-WIMServicingADRProperties {
 
     Write-Log "Applying ADR filter properties for: $ADRName"
 
-    # --- Approach 1: Use Set-CMAutoDeploymentRule cmdlet to update criteria ---
-    # The Set cmdlet works on existing ADRs even when New cmdlet fails.
-    $cmdletWorked = $false
-    Write-Log "Trying Set-CMAutoDeploymentRule cmdlet to apply filter criteria..."
-    try {
+    # Use Set-CMSoftwareUpdateAutoDeploymentRule with typed filter parameters
+    $setCmdlet = Get-Command Set-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
+    if (-not $setCmdlet) {
         $setCmdlet = Get-Command Set-CMAutoDeploymentRule -ErrorAction SilentlyContinue
-        if (-not $setCmdlet) {
-            $setCmdlet = Get-Command Set-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
-        }
-        if ($setCmdlet) {
-            # Build classification array
-            $classifications = @('Security Updates', 'Critical Updates', 'Updates')
-
-            # The Set cmdlet accepts filter criteria as parameters
-            & $setCmdlet.Name -Name $ADRName `
-                -UpdateFilterCriteria "Title contains `"$TitleCriteria`"" `
-                -ErrorAction Stop
-            Write-Log "Title filter applied via cmdlet." -Level SUCCESS
-            $cmdletWorked = $true
-        } else {
-            Write-Log "Set-CMAutoDeploymentRule cmdlet not available." -Level WARN
-        }
-    } catch {
-        Write-Log "Cmdlet criteria update failed: $($_.Exception.Message)" -Level WARN
     }
 
-    # --- Approach 2: Modify the existing ADR's UpdateRuleXML via WMI ---
-    # The manually-created ADR already has valid XML; we modify it in-place.
-    if (-not $cmdletWorked) {
-        Write-Log "Attempting to update ADR criteria via WMI (UpdateRuleXML)..."
+    if ($setCmdlet) {
+        $cmdletName = $setCmdlet.Name
+        Write-Log "Using cmdlet: $cmdletName"
+
+        # Apply product filter
         try {
-            $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
-                                    -ComputerName $SiteServer `
-                                    -Class $script:ADRWmiClass `
-                                    -Filter "Name = '$ADRName'" `
-                                    -ErrorAction Stop
-
-            if (-not $adrWmi) {
-                Write-Log "ADR WMI object not found for: $ADRName" -Level ERROR
-                return
-            }
-
-            # Read existing UpdateRuleXML - the console-created ADR has a valid template
-            $existingXML = $adrWmi.UpdateRuleXML
-            $xmlModified = $false
-
-            if ($existingXML) {
-                Write-Log "Existing UpdateRuleXML found - modifying in-place..."
-                Write-Log "  Current XML length: $($existingXML.Length) chars"
-                # Don't replace the XML wholesale - just log what's there for debugging
-                # The console wizard already set up valid products/classifications
-                # We just need to verify it looks correct
-                Write-Log "  UpdateRuleXML preserved from console-created ADR." -Level SUCCESS
-                $xmlModified = $true
-            }
-
-            # Update collection and description - these are safe direct properties
-            $changed = $false
-            if ($adrWmi.Description -ne "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName).") {
-                $adrWmi.Description = "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)."
-                $changed = $true
-            }
-
-            if ($changed) {
-                $adrWmi.Put() | Out-Null
-                Write-Log "ADR description updated via WMI." -Level SUCCESS
-            }
-
-            # Log guidance for manual verification
-            if (-not $xmlModified) {
-                Write-Log "No UpdateRuleXML found on ADR. Please verify filter criteria in the console:" -Level WARN
-                Write-Log "  Product        : $($OS.Product)" -Level WARN
-                Write-Log "  Classifications: Security Updates, Critical Updates, Updates" -Level WARN
-                Write-Log "  Title contains : $TitleCriteria" -Level WARN
-            }
+            & $cmdletName -Name $ADRName -Product $OS.Product -ErrorAction Stop
+            Write-Log "Product filter set to: $($OS.Product)" -Level SUCCESS
         } catch {
-            Write-Log "WMI criteria update failed: $_" -Level WARN
-            Write-Log "Please verify ADR filter criteria manually in the console:" -Level WARN
-            Write-Log "  Product        : $($OS.Product)" -Level WARN
-            Write-Log "  Classifications: Security Updates, Critical Updates, Updates" -Level WARN
-            Write-Log "  Title contains : $TitleCriteria" -Level WARN
+            Write-Log "Product filter failed: $($_.Exception.Message)" -Level WARN
         }
+
+        # Apply classification filter
+        try {
+            & $cmdletName -Name $ADRName -UpdateClassification @('Security Updates', 'Critical Updates', 'Updates') -ErrorAction Stop
+            Write-Log "Classification filter set." -Level SUCCESS
+        } catch {
+            Write-Log "Classification filter failed: $($_.Exception.Message)" -Level WARN
+        }
+
+        # Apply title filter
+        try {
+            & $cmdletName -Name $ADRName -Title $TitleCriteria -ErrorAction Stop
+            Write-Log "Title filter set to: $TitleCriteria" -Level SUCCESS
+        } catch {
+            Write-Log "Title filter failed: $($_.Exception.Message)" -Level WARN
+        }
+
+        # Apply superseded filter
+        try {
+            & $cmdletName -Name $ADRName -Superseded $false -ErrorAction Stop
+            Write-Log "Superseded filter set to: false" -Level SUCCESS
+        } catch {
+            Write-Log "Superseded filter failed: $($_.Exception.Message)" -Level WARN
+        }
+
+        # Apply description
+        try {
+            & $cmdletName -Name $ADRName -Description "Monthly LCU download for offline WIM servicing of $($OS.FriendlyName)." -ErrorAction Stop
+            Write-Log "Description updated." -Level SUCCESS
+        } catch {
+            Write-Log "Description update failed (non-fatal): $($_.Exception.Message)" -Level WARN
+        }
+    } else {
+        Write-Log "Set-CMSoftwareUpdateAutoDeploymentRule cmdlet not available." -Level WARN
+        Write-Log "Please configure ADR filter criteria manually in the console:" -Level WARN
+        Write-Log "  Product        : $($OS.Product)" -Level WARN
+        Write-Log "  Classifications: Security Updates, Critical Updates, Updates" -Level WARN
+        Write-Log "  Title contains : $TitleCriteria" -Level WARN
+        Write-Log "  Superseded     : No" -Level WARN
     }
 
-    # --- Schedule: skip WMI schedule assignment ---
-    # The manually-created ADR has the schedule the user set in the wizard.
-    # Trying to set Schedule via WMI causes "Generic failure" on most ConfigMgr versions.
-    # Instead, log guidance for the user to verify/adjust the schedule.
-    Write-Log "Schedule: Verify in the ADR properties that it runs after Patch Tuesday." -Level WARN
+    # Schedule guidance - WMI schedule assignment causes "Generic failure"
+    Write-Log "Schedule: Verify in ADR properties that it runs after Patch Tuesday." -Level WARN
     Write-Log "  Recommended: Wednesday after 2nd Tuesday of each month at 03:00"
     Write-Log "  Right-click ADR > Properties > Evaluation Schedule to adjust."
 }
@@ -1223,14 +1194,45 @@ function Test-SUPProductSync {
 function Invoke-ADREvaluation {
     param([string]$Name)
     Write-Log "Triggering immediate ADR evaluation: $Name"
-    try {
-        Invoke-CMAutoDeploymentRuleSync -Name $Name -ErrorAction Stop
-        Write-Log "ADR evaluation triggered. Monitor RuleEngine.log on the site server for progress." -Level SUCCESS
-        Write-Log "Updates will download to: $PackageSourcePath" -Level SUCCESS
-    } catch {
-        Write-Log "ADR evaluation trigger failed: $_" -Level WARN
-        Write-Log "You can trigger it manually: right-click the ADR in console > Run Now" -Level WARN
+
+    # Try multiple cmdlet names - varies by ConfigMgr console version
+    $evalCmdlet = Get-Command Invoke-CMSoftwareUpdateAutoDeploymentRule -ErrorAction SilentlyContinue
+    if (-not $evalCmdlet) {
+        $evalCmdlet = Get-Command Invoke-CMAutoDeploymentRule -ErrorAction SilentlyContinue
     }
+
+    if ($evalCmdlet) {
+        try {
+            & $evalCmdlet.Name -Name $Name -ErrorAction Stop
+            Write-Log "ADR evaluation triggered. Monitor RuleEngine.log on the site server for progress." -Level SUCCESS
+            Write-Log "Updates will download to: $PackageSourcePath" -Level SUCCESS
+            return
+        } catch {
+            Write-Log "Cmdlet evaluation trigger failed: $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    # Fallback: trigger via WMI method
+    if ($script:ADRWmiClass) {
+        try {
+            $adrWmi = Get-WmiObject -Namespace "root\SMS\site_$SiteCode" `
+                                    -ComputerName $SiteServer `
+                                    -Class $script:ADRWmiClass `
+                                    -Filter "Name = '$Name'" `
+                                    -ErrorAction Stop
+            if ($adrWmi) {
+                $adrWmi.InvokeMethod('RunNow', $null) | Out-Null
+                Write-Log "ADR evaluation triggered via WMI. Monitor RuleEngine.log for progress." -Level SUCCESS
+                Write-Log "Updates will download to: $PackageSourcePath" -Level SUCCESS
+                return
+            }
+        } catch {
+            Write-Log "WMI evaluation trigger also failed: $($_.Exception.Message)" -Level WARN
+        }
+    }
+
+    Write-Log "Could not trigger ADR evaluation automatically." -Level WARN
+    Write-Log "Trigger it manually: right-click the ADR in console > Run Now" -Level WARN
 }
 
 #endregion
